@@ -31,6 +31,7 @@ type WebRTCBridge struct {
 	resolution     string
 	streamType     int
 	isHEVC         bool
+	videoClarities []int
 	user           *storage.UserSession
 	storageManager *storage.StorageManager
 
@@ -141,8 +142,9 @@ func (wb *WebRTCBridge) Start() error {
 	// Determine stream settings
 	wb.streamType = tuya.GetStreamType(&skill, wb.resolution)
 	wb.isHEVC = tuya.IsHEVC(&skill, wb.streamType)
+	wb.videoClarities = webRTCConfig.Result.VedioClaritys
 
-	core.Logger.Info().Msgf("Stream settings - Resolution: %s, Type: %d, HEVC: %v", wb.resolution, wb.streamType, wb.isHEVC)
+	core.Logger.Info().Msgf("Stream settings - Resolution: %s, Type: %d, HEVC: %v, Clarities: %v", wb.resolution, wb.streamType, wb.isHEVC, wb.videoClarities)
 
 	// Setup WebRTC peer connection
 	if err := wb.setupPeerConnection(&webRTCConfig.Result); err != nil {
@@ -322,7 +324,9 @@ func (wb *WebRTCBridge) setupPeerConnection(webRTCConfig *tuya.WebRTCConfig) err
 
 			if !wb.isHEVC {
 				if wb.resolution == "hd" {
-					_ = wb.cameraClient.SendResolution(0)
+					clarity := pickVideoClarity(wb.videoClarities, wb.resolution)
+					core.Logger.Info().Msgf("Sending video clarity %d for %s (supported: %v)", clarity, wb.resolution, wb.videoClarities)
+					_ = wb.cameraClient.SendResolution(clarity)
 				}
 				wb.waiter.Done(nil)
 			}
@@ -618,4 +622,29 @@ func (wb *WebRTCBridge) handleError(err error) {
 		wb.waiter.Done(err)
 		wb.OnError(err)
 	}
+}
+
+// pickVideoClarity maps a stream resolution to a Tuya "clarity" value the device
+// actually supports. Devices enumerate the supported values in VedioClaritys
+// (e.g. [2 4], higher = HD, lower = SD). Returns 0 when nothing is known, which
+// preserves the previous behaviour of sending 0.
+func pickVideoClarity(clarities []int, resolution string) int {
+	if len(clarities) == 0 {
+		return 0
+	}
+
+	high, low := clarities[0], clarities[0]
+	for _, c := range clarities {
+		if c > high {
+			high = c
+		}
+		if c < low {
+			low = c
+		}
+	}
+
+	if resolution == "sd" {
+		return low
+	}
+	return high
 }
