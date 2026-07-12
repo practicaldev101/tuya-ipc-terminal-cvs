@@ -34,6 +34,13 @@ type RTPForwarder struct {
 	firstVideoPacket atomic.Bool
 	firstAudioPacket atomic.Bool
 
+	// Cached H.264 parameter sets from the live stream. Clients that join
+	// mid-GOP need these (via sprop-parameter-sets in the SDP) to initialize
+	// their decoder; otherwise they log "non-existing PPS" until the next IDR.
+	spsNAL     []byte
+	ppsNAL     []byte
+	paramMutex sync.RWMutex
+
 	OnBackchannelAudio func(*rtp.Packet)
 }
 
@@ -234,7 +241,58 @@ func (rf *RTPForwarder) RemoveClient(sessionID string) {
 	}
 }
 
+// cacheParameterSets extracts SPS/PPS NAL units from an H.264 RTP payload
+// (single NAL or STAP-A aggregation) and caches them for SDP generation.
+func (rf *RTPForwarder) cacheParameterSets(payload []byte) {
+	if len(payload) < 1 {
+		return
+	}
+
+	cacheNAL := func(nal []byte) {
+		if len(nal) < 1 {
+			return
+		}
+		switch nal[0] & 0x1F {
+		case 7: // SPS
+			rf.paramMutex.Lock()
+			rf.spsNAL = append([]byte(nil), nal...)
+			rf.paramMutex.Unlock()
+		case 8: // PPS
+			rf.paramMutex.Lock()
+			rf.ppsNAL = append([]byte(nil), nal...)
+			rf.paramMutex.Unlock()
+		}
+	}
+
+	switch payload[0] & 0x1F {
+	case 7, 8:
+		cacheNAL(payload)
+	case 24: // STAP-A: [header][size][NAL][size][NAL]...
+		i := 1
+		for i+2 <= len(payload) {
+			size := int(payload[i])<<8 | int(payload[i+1])
+			i += 2
+			if size <= 0 || i+size > len(payload) {
+				break
+			}
+			cacheNAL(payload[i : i+size])
+			i += size
+		}
+	}
+}
+
+// GetParameterSets returns the cached SPS and PPS NAL units (nil if not seen yet).
+func (rf *RTPForwarder) GetParameterSets() ([]byte, []byte) {
+	rf.paramMutex.RLock()
+	defer rf.paramMutex.RUnlock()
+	return rf.spsNAL, rf.ppsNAL
+}
+
 func (rf *RTPForwarder) ForwardVideoPacket(packet *rtp.Packet) {
+	// Cache SPS/PPS even when nobody is connected yet, so the SDP for the
+	// next client can carry sprop-parameter-sets.
+	rf.cacheParameterSets(packet.Payload)
+
 	rf.mutex.RLock()
 	defer rf.mutex.RUnlock()
 

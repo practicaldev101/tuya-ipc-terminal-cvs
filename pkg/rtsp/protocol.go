@@ -3,6 +3,7 @@ package rtsp
 import (
 	"bufio"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -287,7 +288,11 @@ func (s *RTSPServer) handleOptions(client *RTSPClient, request *RTSPRequest) {
 
 func (s *RTSPServer) handleDescribe(client *RTSPClient, request *RTSPRequest) {
 	// Generate SDP for the camera stream
-	sdp := s.generateSDP(client.stream.camera, request.URL, client.stream.resolution)
+	var sps, pps []byte
+	if client.stream.webrtcBridge != nil && client.stream.webrtcBridge.rtpForwarder != nil {
+		sps, pps = client.stream.webrtcBridge.rtpForwarder.GetParameterSets()
+	}
+	sdp := s.generateSDPWithParameterSets(client.stream.camera, request.URL, client.stream.resolution, sps, pps)
 
 	headers := map[string]string{
 		"CSeq":          strconv.Itoa(request.CSeq),
@@ -520,6 +525,24 @@ func (s *RTSPServer) handleUnsupportedMethod(client *RTSPClient, request *RTSPRe
 }
 
 func (s *RTSPServer) generateSDP(camera *storage.CameraInfo, baseURL, streamResolution string) string {
+	return s.generateSDPWithParameterSets(camera, baseURL, streamResolution, nil, nil)
+}
+
+// generateSDPWithParameterSets builds the DESCRIBE SDP. When live H.264 SPS/PPS
+// NAL units are known they are advertised via sprop-parameter-sets (and the
+// real profile-level-id) so clients joining mid-GOP can initialize their
+// decoder immediately.
+func (s *RTSPServer) generateSDPWithParameterSets(camera *storage.CameraInfo, baseURL, streamResolution string, sps, pps []byte) string {
+	h264Fmtp := "a=fmtp:96 packetization-mode=1;profile-level-id=42001e\r\n"
+	if len(sps) >= 4 && len(pps) > 0 {
+		h264Fmtp = fmt.Sprintf(
+			"a=fmtp:96 packetization-mode=1;profile-level-id=%02x%02x%02x;sprop-parameter-sets=%s,%s\r\n",
+			sps[1], sps[2], sps[3],
+			base64.StdEncoding.EncodeToString(sps),
+			base64.StdEncoding.EncodeToString(pps),
+		)
+	}
+
 	sdp := "v=0\r\n"
 	sdp += fmt.Sprintf("o=- %d %d IN IP4 0.0.0.0\r\n", time.Now().Unix(), time.Now().Unix())
 	sdp += "s=Tuya Camera Stream\r\n"
@@ -561,14 +584,14 @@ func (s *RTSPServer) generateSDP(camera *storage.CameraInfo, baseURL, streamReso
 				// H.264
 				videoSdp += "m=video 0 RTP/AVP 96\r\n"
 				videoSdp += "a=rtpmap:96 H264/90000\r\n"
-				videoSdp += "a=fmtp:96 packetization-mode=1;profile-level-id=42001e\r\n"
+				videoSdp += h264Fmtp
 			}
 		}
 	} else {
 		// Fallback in case no video stream is found
 		videoSdp += "m=video 0 RTP/AVP 96\r\n"
 		videoSdp += "a=rtpmap:96 H264/90000\r\n"
-		videoSdp += "a=fmtp:96 packetization-mode=1;profile-level-id=42001e\r\n"
+		videoSdp += h264Fmtp
 	}
 
 	videoSdp += fmt.Sprintf("a=control:%s/video\r\n", baseURL)
