@@ -12,6 +12,11 @@
 // HTTP 5xx, ...) says nothing about the session: the previous validity is
 // kept, the failure is reported as check_error and the check is retried
 // after CheckErrorRetryInterval.
+//
+// Besides the schedule, RequestCheck asks Run to check one user right away
+// (e.g. when Tuya rejected a stream start with USER_SESSION_INVALID). These
+// on-demand checks run the same validation / re-login logic, are serialized
+// with the scheduled checks and are rate-limited per user.
 package session
 
 import (
@@ -35,7 +40,10 @@ const (
 	// DefaultCheckErrorRetryInterval: next check after a validation that
 	// failed for transport/server reasons.
 	DefaultCheckErrorRetryInterval = 5 * time.Minute
-	minDelay                       = time.Minute
+	// DefaultRecheckMinInterval: minimum time between two on-demand checks
+	// of the same user (RequestCheck).
+	DefaultRecheckMinInterval = 30 * time.Second
+	minDelay                  = time.Minute
 )
 
 // Store is the subset of storage.StorageManager used by the keeper.
@@ -83,8 +91,11 @@ type Config struct {
 	// CheckErrorRetryInterval is the next check after a validation that
 	// failed for transport/server reasons.
 	CheckErrorRetryInterval time.Duration
-	Credentials             *Credentials // nil: cannot re-login, only report
-	Now                     func() time.Time
+	// RecheckMinInterval is the minimum time between two on-demand checks
+	// (RequestCheck) of the same user.
+	RecheckMinInterval time.Duration
+	Credentials        *Credentials // nil: cannot re-login, only report
+	Now                func() time.Time
 }
 
 // Status is the last known state of one stored user session.
@@ -102,6 +113,9 @@ type Status struct {
 	// (transport/server error); Valid and Error then carry the previous
 	// result.
 	CheckError string `json:"check_error,omitempty"`
+
+	// reloginFailed: this check attempted a re-login and it failed.
+	reloginFailed bool
 }
 
 // Keeper validates and renews stored sessions.
@@ -113,6 +127,12 @@ type Keeper struct {
 
 	mutex    sync.RWMutex
 	statuses map[string]Status
+
+	// On-demand checks (RequestCheck -> Run).
+	wake        chan struct{} // capacity 1: "pending is not empty"
+	reqMutex    sync.Mutex
+	pending     map[string]string    // user key -> reason
+	lastRequest map[string]time.Time // user key -> last accepted request
 }
 
 // NewKeeper builds a Keeper; zero (or negative) Config durations take the
@@ -133,15 +153,21 @@ func NewKeeper(cfg Config, store Store, validate ValidateFunc, login LoginFunc) 
 	if cfg.CheckErrorRetryInterval <= 0 {
 		cfg.CheckErrorRetryInterval = DefaultCheckErrorRetryInterval
 	}
+	if cfg.RecheckMinInterval <= 0 {
+		cfg.RecheckMinInterval = DefaultRecheckMinInterval
+	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
 	return &Keeper{
-		cfg:      cfg,
-		store:    store,
-		validate: validate,
-		login:    login,
-		statuses: make(map[string]Status),
+		cfg:         cfg,
+		store:       store,
+		validate:    validate,
+		login:       login,
+		statuses:    make(map[string]Status),
+		wake:        make(chan struct{}, 1),
+		pending:     make(map[string]string),
+		lastRequest: make(map[string]time.Time),
 	}
 }
 
@@ -197,17 +223,98 @@ func Decide(now, expiresAt time.Time, margin time.Duration, validationErr error)
 }
 
 // Run checks all sessions immediately and then on schedule until ctx ends.
+// Users passed to RequestCheck are checked as soon as possible in between;
+// all checks run on this goroutine, so they never overlap.
 func (k *Keeper) Run(ctx context.Context) {
+	delay := k.CheckAll(ctx)
+	deadline := time.Now().Add(delay)
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
 	for {
-		delay := k.CheckAll(ctx)
-		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
-			timer.Stop()
 			return
 		case <-timer.C:
+			delay = k.CheckAll(ctx)
+			deadline = time.Now().Add(delay)
+			timer.Reset(delay)
+		case <-k.wake:
+			// An on-demand check that needs an earlier retry (failed
+			// re-login, failed check) pulls the next scheduled check in.
+			if delay, ok := k.CheckPending(ctx); ok && delay < time.Until(deadline) {
+				deadline = time.Now().Add(delay)
+				timer.Reset(delay)
+			}
 		}
 	}
+}
+
+// RequestCheck asks Run to validate (and if needed renew) the session of
+// userKey now instead of at the next scheduled check, e.g. because Tuya
+// rejected a stream start. It never blocks. A request is dropped (false)
+// when the same user was requested less than RecheckMinInterval ago, or
+// when its last check ended in a failed re-login less than RetryInterval
+// ago (the regular retry of a failed re-login is not shortened, so a wrong
+// password cannot turn into a login loop).
+func (k *Keeper) RequestCheck(userKey, reason string) bool {
+	now := k.cfg.Now()
+	log := core.Logger.With().Str("component", "session").Str("user", userKey).Str("reason", reason).Logger()
+
+	if status, ok := k.getStatus(userKey); ok && status.reloginFailed && now.Sub(status.CheckedAt) < k.cfg.RetryInterval {
+		log.Debug().Msg("session: on-demand check skipped, last re-login failed recently")
+		return false
+	}
+
+	k.reqMutex.Lock()
+	if last, ok := k.lastRequest[userKey]; ok && now.Sub(last) < k.cfg.RecheckMinInterval {
+		k.reqMutex.Unlock()
+		log.Debug().Dur("min_interval", k.cfg.RecheckMinInterval).Msg("session: on-demand check rate-limited")
+		return false
+	}
+	k.lastRequest[userKey] = now
+	k.pending[userKey] = reason
+	k.reqMutex.Unlock()
+
+	select {
+	case k.wake <- struct{}{}:
+	default: // a wake-up is already queued; it drains all pending users
+	}
+	log.Warn().Msg("session: on-demand check requested")
+	return true
+}
+
+// CheckPending checks the users requested through RequestCheck (Run calls
+// it; exported for tests). ok is false when nothing was checked; otherwise
+// delay is the earliest next check those results ask for.
+func (k *Keeper) CheckPending(ctx context.Context) (delay time.Duration, ok bool) {
+	k.reqMutex.Lock()
+	pending := k.pending
+	k.pending = make(map[string]string)
+	k.reqMutex.Unlock()
+	if len(pending) == 0 {
+		return 0, false
+	}
+
+	users, err := k.store.ListUsers()
+	if err != nil {
+		core.Logger.Error().Err(err).Str("component", "session").Msg("session: cannot list stored users")
+		return k.cfg.RetryInterval, true
+	}
+	next := k.cfg.CheckInterval
+	for _, user := range users {
+		reason, requested := pending[user.UserKey]
+		if !requested || ctx.Err() != nil {
+			continue
+		}
+		core.Logger.Info().Str("component", "session").Str("user", user.UserKey).Str("reason", reason).
+			Msg("session: on-demand check")
+		next = k.checkAndRecord(ctx, user, next)
+		ok = true
+	}
+	if next < minDelay {
+		next = minDelay
+	}
+	return next, ok
 }
 
 // CheckAll validates (and if needed renews) every stored session once and
@@ -224,29 +331,36 @@ func (k *Keeper) CheckAll(ctx context.Context) time.Duration {
 		if ctx.Err() != nil {
 			return next
 		}
-		status := k.checkUser(ctx, user)
-		k.setStatus(status)
-
-		// A failed re-login is retried sooner (but not in a tight loop).
-		if status.Error != "" && status.CredentialsConfigured && k.cfg.RetryInterval < next {
-			next = k.cfg.RetryInterval
-		}
-		// A check that could not reach a verdict is retried soon.
-		if status.CheckError != "" && k.cfg.CheckErrorRetryInterval < next {
-			next = k.cfg.CheckErrorRetryInterval
-		}
-		// Wake up in time to renew when the margin is reached before the
-		// next regular check.
-		if !status.ExpiresAt.IsZero() {
-			untilRenew := status.ExpiresAt.Add(-k.cfg.RenewMargin).Sub(k.cfg.Now())
-			if untilRenew > 0 && untilRenew < next {
-				next = untilRenew
-			}
-		}
+		next = k.checkAndRecord(ctx, user, next)
 	}
 
 	if next < minDelay {
 		next = minDelay
+	}
+	return next
+}
+
+// checkAndRecord checks one user, stores the status and returns next,
+// shortened to when this user needs its next check.
+func (k *Keeper) checkAndRecord(ctx context.Context, user storage.UserSession, next time.Duration) time.Duration {
+	status := k.checkUser(ctx, user)
+	k.setStatus(status)
+
+	// A failed re-login is retried sooner (but not in a tight loop).
+	if status.Error != "" && status.CredentialsConfigured && k.cfg.RetryInterval < next {
+		next = k.cfg.RetryInterval
+	}
+	// A check that could not reach a verdict is retried soon.
+	if status.CheckError != "" && k.cfg.CheckErrorRetryInterval < next {
+		next = k.cfg.CheckErrorRetryInterval
+	}
+	// Wake up in time to renew when the margin is reached before the
+	// next regular check.
+	if !status.ExpiresAt.IsZero() {
+		untilRenew := status.ExpiresAt.Add(-k.cfg.RenewMargin).Sub(k.cfg.Now())
+		if untilRenew > 0 && untilRenew < next {
+			next = untilRenew
+		}
 	}
 	return next
 }
@@ -340,6 +454,7 @@ func (k *Keeper) checkUser(ctx context.Context, user storage.UserSession) Status
 	if err != nil {
 		log.Error().Err(err).Str("reason", reason).Msg("session: re-login failed")
 		status.Error = "re-login failed: " + err.Error()
+		status.reloginFailed = true
 		return status
 	}
 
