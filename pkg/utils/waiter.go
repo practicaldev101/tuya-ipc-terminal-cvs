@@ -46,11 +46,18 @@ func (w *Waiter) Done(err error) {
 	// safe run Done only when have tasks
 	if w.state > 0 {
 		w.state--
-		w.WaitGroup.Done()
-	}
 
-	// block waiter for any operations after last done
-	if w.state == 0 {
+		// Publish the result BEFORE releasing waiters: Wait() reads w.err
+		// right after WaitGroup.Wait() returns, so setting it afterwards was
+		// a data race and could report success (nil) for a failed attempt.
+		if w.state == 0 {
+			w.state = -1
+			w.err = err
+		}
+
+		w.WaitGroup.Done()
+	} else if w.state == 0 {
+		// block waiter for any operations after last done
 		w.state = -1
 		w.err = err
 	}
