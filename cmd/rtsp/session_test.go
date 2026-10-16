@@ -3,6 +3,7 @@ package rtsp
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -14,6 +15,7 @@ func newSessionTestCmd() *cobra.Command {
 	cmd.Flags().Duration("session-check-interval", session.DefaultCheckInterval, "")
 	cmd.Flags().Duration("session-renew-margin", session.DefaultRenewMargin, "")
 	cmd.Flags().Duration("session-lifetime", session.DefaultSessionLifetime, "")
+	cmd.Flags().Duration("session-recheck-min-interval", session.DefaultRecheckMinInterval, "")
 	cmd.Flags().String("credentials-file", "", "")
 	return cmd
 }
@@ -74,5 +76,27 @@ func TestZeroCheckIntervalDisablesKeeper(t *testing.T) {
 	cfg, err := sessionConfigFromFlags(newSessionTestCmd())
 	if err != nil || cfg != nil {
 		t.Fatalf("interval 0 must disable the keeper, got cfg=%+v err=%v", cfg, err)
+	}
+}
+
+func TestSessionRecheckMinInterval(t *testing.T) {
+	clearCredentialEnv(t)
+	t.Setenv("TUYA_SESSION_RECHECK_MIN_INTERVAL", "")
+	cfg, err := sessionConfigFromFlags(newSessionTestCmd())
+	if err != nil || cfg.RecheckMinInterval != 30*time.Second {
+		t.Fatalf("default recheck min interval = %v (err %v), want 30s", cfg.RecheckMinInterval, err)
+	}
+
+	t.Setenv("TUYA_SESSION_RECHECK_MIN_INTERVAL", "45")
+	cfg, err = sessionConfigFromFlags(newSessionTestCmd())
+	if err != nil || cfg.RecheckMinInterval != 45*time.Second {
+		t.Fatalf("env recheck min interval = %v (err %v), want 45s", cfg.RecheckMinInterval, err)
+	}
+
+	cmd := newSessionTestCmd()
+	_ = cmd.Flags().Set("session-recheck-min-interval", "10s")
+	cfg, err = sessionConfigFromFlags(cmd)
+	if err != nil || cfg.RecheckMinInterval != 10*time.Second {
+		t.Fatalf("flag recheck min interval = %v (err %v), want 10s (flag wins)", cfg.RecheckMinInterval, err)
 	}
 }

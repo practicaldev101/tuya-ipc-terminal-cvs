@@ -62,6 +62,7 @@ func newStartCmd() *cobra.Command {
 	cmd.Flags().Duration("session-check-interval", session.DefaultCheckInterval, "How often stored Tuya sessions are validated and renewed; 0 disables the session keeper [env TUYA_SESSION_CHECK_INTERVAL]")
 	cmd.Flags().Duration("session-renew-margin", session.DefaultRenewMargin, "Re-login this long before the session's expected expiry [env TUYA_SESSION_RENEW_MARGIN]")
 	cmd.Flags().Duration("session-lifetime", session.DefaultSessionLifetime, "Assumed session lifetime after login when cookies carry no expiry [env TUYA_SESSION_LIFETIME]")
+	cmd.Flags().Duration("session-recheck-min-interval", session.DefaultRecheckMinInterval, "Minimum time between two immediate session checks of one user, triggered when Tuya rejects a stream start (e.g. USER_SESSION_INVALID) [env TUYA_SESSION_RECHECK_MIN_INTERVAL]")
 	cmd.Flags().String("health-listen", "", "Serve JSON health at http://<addr>/healthz; \"8556\" or \":8556\" binds 127.0.0.1:8556. Empty disables [env TUYA_HEALTH_LISTEN]")
 	cmd.Flags().String("credentials-file", "", "File with TUYA_EMAIL=, TUYA_PASSWORD= and optional TUYA_REGION= lines for non-interactive re-login (overrides those env vars) [env TUYA_CREDENTIALS_FILE]")
 
@@ -151,6 +152,17 @@ func runStartServer(cmd *cobra.Command, args []string) error {
 	rtspServer.SetMediaTimeout(mediaTimeout)
 	rtspServer.SetStartupTimeout(startupTimeout)
 
+	var keeper *session.Keeper
+	if sessionCfg != nil {
+		keeper = session.NewKeeper(*sessionCfg, storageManager, session.TuyaValidate, session.TuyaPasswordLogin(lookupRegion))
+		// A stream start rejected by Tuya (e.g. USER_SESSION_INVALID after
+		// another client logged in) checks the session now instead of at
+		// the next scheduled check (rate-limited per user).
+		rtspServer.SetSessionRejectedHandler(func(userKey string, err error) {
+			keeper.RequestCheck(userKey, err.Error())
+		})
+	}
+
 	core.Logger.Info().Msgf("Starting RTSP server on %s...", rtsp.ListenAddress(address, port))
 
 	if err := rtspServer.Start(); err != nil {
@@ -161,10 +173,9 @@ func runStartServer(cmd *cobra.Command, args []string) error {
 	defer stopBackground()
 
 	var sessions health.SessionSource
-	if sessionCfg != nil {
-		keeper := session.NewKeeper(*sessionCfg, storageManager, session.TuyaValidate, session.TuyaPasswordLogin(lookupRegion))
-		core.Logger.Info().Msgf("Session keeper enabled: check every %v, renew %v before expiry, credentials configured: %v",
-			sessionCfg.CheckInterval, sessionCfg.RenewMargin, sessionCfg.Credentials != nil)
+	if keeper != nil {
+		core.Logger.Info().Msgf("Session keeper enabled: check every %v, renew %v before expiry, immediate re-check on rejected stream starts at most every %v, credentials configured: %v",
+			sessionCfg.CheckInterval, sessionCfg.RenewMargin, sessionCfg.RecheckMinInterval, sessionCfg.Credentials != nil)
 		go keeper.Run(backgroundCtx)
 		sessions = keeper
 	} else {
@@ -311,6 +322,13 @@ func sessionConfigFromFlags(cmd *cobra.Command) (*session.Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	recheckMinInterval, err := durationFlagOrEnv(cmd, "session-recheck-min-interval", "TUYA_SESSION_RECHECK_MIN_INTERVAL")
+	if err != nil {
+		return nil, err
+	}
+	if recheckMinInterval <= 0 {
+		recheckMinInterval = session.DefaultRecheckMinInterval
+	}
 
 	credentialsFile := stringFlagOrEnv(cmd, "credentials-file", session.EnvCredentialsFile)
 	credentials, err := session.LoadCredentials(credentialsFile, os.Getenv)
@@ -331,7 +349,9 @@ func sessionConfigFromFlags(cmd *cobra.Command) (*session.Config, error) {
 		CheckInterval:   interval,
 		RenewMargin:     margin,
 		SessionLifetime: lifetime,
-		Credentials:     credentials,
+		// Explicit so the startup log shows the effective value.
+		RecheckMinInterval: recheckMinInterval,
+		Credentials:        credentials,
 	}, nil
 }
 
