@@ -45,10 +45,11 @@ func newStartCmd() *cobra.Command {
 		RunE:  runStartServer,
 	}
 
-	cmd.Flags().String("listen", rtsp.DefaultListenAddress, "RTSP server listening address (host or IP). Defaults to loopback only; use \"0.0.0.0\" or \"::\" to listen on all interfaces.")
+	cmd.Flags().String("listen", rtsp.DefaultListenAddress, "RTSP server listening address (host or IP). Defaults to loopback only; use \"0.0.0.0\" or \"::\" to listen on all interfaces [env TUYA_RTSP_LISTEN]")
 	cmd.Flags().StringP("address", "a", rtsp.DefaultListenAddress, "Deprecated alias for --listen")
 	_ = cmd.Flags().MarkDeprecated("address", "use --listen instead")
 	cmd.Flags().IntP("port", "p", 8554, "RTSP server port")
+	cmd.Flags().Duration("media-timeout", rtsp.DefaultMediaTimeout, "Tear a stream down (even with RTSP clients attached) when no video RTP arrived for this long; 0 disables [env TUYA_MEDIA_TIMEOUT]")
 	cmd.Flags().BoolP("daemon", "d", false, "Run as daemon (background)")
 
 	return cmd
@@ -86,9 +87,13 @@ func newListEndpointsCmd() *cobra.Command {
 }
 
 func runStartServer(cmd *cobra.Command, args []string) error {
-	address, _ := cmd.Flags().GetString("listen")
+	address := stringFlagOrEnv(cmd, "listen", "TUYA_RTSP_LISTEN")
 	if !cmd.Flags().Changed("listen") && cmd.Flags().Changed("address") {
 		address, _ = cmd.Flags().GetString("address")
+	}
+	mediaTimeout, err := durationFlagOrEnv(cmd, "media-timeout", "TUYA_MEDIA_TIMEOUT")
+	if err != nil {
+		return err
 	}
 	port, _ := cmd.Flags().GetInt("port")
 	daemon, _ := cmd.Flags().GetBool("daemon")
@@ -121,6 +126,7 @@ func runStartServer(cmd *cobra.Command, args []string) error {
 
 	// Create and start RTSP server
 	rtspServer = rtsp.NewRTSPServer(address, port, storageManager)
+	rtspServer.SetMediaTimeout(mediaTimeout)
 
 	core.Logger.Info().Msgf("Starting RTSP server on %s...", rtsp.ListenAddress(address, port))
 
