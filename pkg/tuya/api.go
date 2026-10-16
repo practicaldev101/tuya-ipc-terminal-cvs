@@ -523,7 +523,7 @@ func GetAppInfo(client *http.Client, serverHost string) (*AppInfoResponse, error
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP error: %d - %s", resp.StatusCode, string(body))
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(body)}
 	}
 
 	var appInfoResponse AppInfoResponse
@@ -532,7 +532,7 @@ func GetAppInfo(client *http.Client, serverHost string) (*AppInfoResponse, error
 	}
 
 	if !appInfoResponse.Success {
-		return nil, errors.New(appInfoResponse.Msg)
+		return nil, &APIError{StatusCode: http.StatusOK, Msg: appInfoResponse.Msg}
 	}
 
 	return &appInfoResponse, nil
@@ -564,7 +564,7 @@ func GetMQTTConfig(client *http.Client, serverHost string) (*MQTTConfigResponse,
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP error: %d - %s", resp.StatusCode, string(body))
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(body)}
 	}
 
 	var mqttConfigResponse MQTTConfigResponse
@@ -573,7 +573,7 @@ func GetMQTTConfig(client *http.Client, serverHost string) (*MQTTConfigResponse,
 	}
 
 	if !mqttConfigResponse.Success {
-		return nil, errors.New(mqttConfigResponse.Msg)
+		return nil, &APIError{StatusCode: http.StatusOK, Msg: mqttConfigResponse.Msg}
 	}
 
 	return &mqttConfigResponse, nil
@@ -615,7 +615,7 @@ func GetWebRTCConfig(client *http.Client, serverHost string, deviceId string) (*
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP error: %d - %s", resp.StatusCode, string(body))
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(body)}
 	}
 
 	var webRTCConfigResponse WebRTCConfigResponse
@@ -624,7 +624,7 @@ func GetWebRTCConfig(client *http.Client, serverHost string, deviceId string) (*
 	}
 
 	if !webRTCConfigResponse.Success {
-		return nil, errors.New(webRTCConfigResponse.Msg)
+		return nil, &APIError{StatusCode: http.StatusOK, Msg: webRTCConfigResponse.Msg}
 	}
 
 	return &webRTCConfigResponse, nil
