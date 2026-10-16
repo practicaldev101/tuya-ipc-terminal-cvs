@@ -4,6 +4,14 @@
 [![Go Version](https://img.shields.io/badge/Go-1.21%2B-blue.svg)](https://golang.org/)
 [![Build Status](https://img.shields.io/badge/Build-Passing-brightgreen.svg)]()
 
+> **CVS fork.** This is the `cvs` branch of
+> [practicaldev101/tuya-ipc-terminal-cvs](https://github.com/practicaldev101/tuya-ipc-terminal-cvs),
+> a pinned fork of upstream PR #33 plus selected fixes, a media watchdog,
+> automatic session renewal, a loopback health endpoint and a pinned Docker
+> build. The RTSP server listens on `127.0.0.1` by default. See
+> [CVS-CHANGES.md](CVS-CHANGES.md) for the exact changes, flags, build and
+> run instructions, and known limitations.
+
 A powerful CLI tool to connect Tuya Smart Cameras to RTSP clients through reverse-engineered Tuya browser client APIs. Stream your Tuya cameras directly to any RTSP-compatible media player or home automation system.
 
 ## ✨ Features
