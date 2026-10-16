@@ -1,6 +1,7 @@
 package rtsp
 
 import (
+	"sort"
 	"time"
 
 	"tuya-ipc-terminal/pkg/core"
@@ -165,4 +166,79 @@ func (cs *CameraStream) teardown() {
 	if cs.webrtcBridge != nil {
 		cs.webrtcBridge.Stop()
 	}
+}
+
+// StreamHealth is a point-in-time view of one stream for the health endpoint.
+type StreamHealth struct {
+	Device      string
+	DeviceID    string
+	RTSPPath    string
+	Resolution  string
+	State       string // starting | active | stopped
+	Clients     int
+	StartedAt   time.Time
+	LastMediaAt time.Time // last video RTP packet (zero: none yet)
+	LastAudioAt time.Time
+}
+
+// StreamsHealth returns the state of every stream currently known to the
+// server (streams exist while RTSP clients are attached or shortly after).
+func (s *RTSPServer) StreamsHealth() []StreamHealth {
+	s.mutex.RLock()
+	streams := make([]*CameraStream, 0, len(s.streams))
+	for _, stream := range s.streams {
+		streams = append(streams, stream)
+	}
+	s.mutex.RUnlock()
+
+	result := make([]StreamHealth, 0, len(streams))
+	for _, stream := range streams {
+		stream.mutex.RLock()
+		health := StreamHealth{
+			Resolution:  stream.resolution,
+			Clients:     len(stream.clients),
+			StartedAt:   stream.startedAt,
+			LastMediaAt: stream.lastMediaLocked(),
+		}
+		if stream.camera != nil {
+			health.Device = stream.camera.DeviceName
+			health.DeviceID = stream.camera.DeviceID
+			health.RTSPPath = stream.camera.RTSPPath
+		}
+		if stream.webrtcBridge != nil && stream.webrtcBridge.rtpForwarder != nil {
+			health.LastAudioAt = stream.webrtcBridge.rtpForwarder.LastAudioAt()
+		}
+		switch {
+		case stream.dead:
+			health.State = "stopped"
+		case stream.active:
+			health.State = "active"
+		case stream.starting || stream.connecting:
+			health.State = "starting"
+		default:
+			health.State = "stopped"
+		}
+		stream.mutex.RUnlock()
+		result = append(result, health)
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].RTSPPath != result[j].RTSPPath {
+			return result[i].RTSPPath < result[j].RTSPPath
+		}
+		return result[i].Resolution < result[j].Resolution
+	})
+	return result
+}
+
+// MediaTimeout returns the configured watchdog timeout (0: disabled).
+func (s *RTSPServer) MediaTimeout() time.Duration {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return s.mediaTimeout
+}
+
+// ListenAddr returns the RTSP host:port the server binds to.
+func (s *RTSPServer) ListenAddr() string {
+	return ListenAddress(s.address, s.port)
 }

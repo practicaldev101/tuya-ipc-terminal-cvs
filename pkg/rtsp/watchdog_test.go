@@ -226,3 +226,21 @@ func TestWatchdogInterval(t *testing.T) {
 		}
 	}
 }
+
+func TestStreamsHealthReportsStateAndLastMedia(t *testing.T) {
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	s := newWatchdogTestServer(now)
+	stream, peer := addActiveStream(t, s, now.Add(-time.Minute))
+	defer peer.Close()
+	last := now.Add(-3 * time.Second)
+	stream.webrtcBridge.rtpForwarder.lastVideoAt.Store(last.UnixNano())
+
+	health := s.StreamsHealth()
+	if len(health) != 1 {
+		t.Fatalf("got %d streams", len(health))
+	}
+	h := health[0]
+	if h.State != "active" || h.Clients != 1 || h.Resolution != "sd" || h.RTSPPath != "/CORN_CHM-302" || !h.LastMediaAt.Equal(last) {
+		t.Fatalf("unexpected health %+v", h)
+	}
+}

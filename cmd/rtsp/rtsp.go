@@ -13,6 +13,7 @@ import (
 
 	"tuya-ipc-terminal/cmd/auth"
 	"tuya-ipc-terminal/pkg/core"
+	"tuya-ipc-terminal/pkg/health"
 	"tuya-ipc-terminal/pkg/rtsp"
 	"tuya-ipc-terminal/pkg/session"
 	"tuya-ipc-terminal/pkg/storage"
@@ -60,6 +61,7 @@ func newStartCmd() *cobra.Command {
 	cmd.Flags().Duration("session-check-interval", session.DefaultCheckInterval, "How often stored Tuya sessions are validated and renewed; 0 disables the session keeper [env TUYA_SESSION_CHECK_INTERVAL]")
 	cmd.Flags().Duration("session-renew-margin", session.DefaultRenewMargin, "Re-login this long before the session's expected expiry [env TUYA_SESSION_RENEW_MARGIN]")
 	cmd.Flags().Duration("session-lifetime", session.DefaultSessionLifetime, "Assumed session lifetime after login when cookies carry no expiry [env TUYA_SESSION_LIFETIME]")
+	cmd.Flags().String("health-listen", "", "Serve JSON health at http://<addr>/healthz; \"8556\" or \":8556\" binds 127.0.0.1:8556. Empty disables [env TUYA_HEALTH_LISTEN]")
 	cmd.Flags().String("credentials-file", "", "File with TUYA_EMAIL=, TUYA_PASSWORD= and optional TUYA_REGION= lines for non-interactive re-login (overrides those env vars) [env TUYA_CREDENTIALS_FILE]")
 
 	return cmd
@@ -109,6 +111,7 @@ func runStartServer(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	healthListen := stringFlagOrEnv(cmd, "health-listen", "TUYA_HEALTH_LISTEN")
 	port, _ := cmd.Flags().GetInt("port")
 	daemon, _ := cmd.Flags().GetBool("daemon")
 
@@ -148,15 +151,27 @@ func runStartServer(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to start RTSP server: %v", err)
 	}
 
-	keeperCtx, stopKeeper := context.WithCancel(context.Background())
-	defer stopKeeper()
+	backgroundCtx, stopBackground := context.WithCancel(context.Background())
+	defer stopBackground()
+
+	var sessions health.SessionSource
 	if sessionCfg != nil {
 		keeper := session.NewKeeper(*sessionCfg, storageManager, session.TuyaValidate, session.TuyaPasswordLogin(lookupRegion))
 		core.Logger.Info().Msgf("Session keeper enabled: check every %v, renew %v before expiry, credentials configured: %v",
 			sessionCfg.CheckInterval, sessionCfg.RenewMargin, sessionCfg.Credentials != nil)
-		go keeper.Run(keeperCtx)
+		go keeper.Run(backgroundCtx)
+		sessions = keeper
 	} else {
 		core.Logger.Warn().Msg("Session keeper disabled: stored sessions will not be validated or renewed")
+	}
+
+	if healthListen != "" {
+		addr, err := health.Serve(backgroundCtx, healthListen, health.Handler(cmd.Root().Version, rtspServer, sessions))
+		if err != nil {
+			_ = rtspServer.Stop()
+			return fmt.Errorf("failed to start health endpoint: %v", err)
+		}
+		core.Logger.Info().Msgf("Health endpoint: http://%s/healthz", addr)
 	}
 
 	if daemon {
