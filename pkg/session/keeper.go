@@ -230,7 +230,7 @@ func (k *Keeper) checkUser(ctx context.Context, user storage.UserSession) Status
 		Str("component", "session").
 		Str("user", user.UserKey).
 		Str("region", user.Region).
-		Time("expires_at", status.ExpiresAt).
+		Str("expires_at", status.ExpiresAt.Format(time.RFC3339)).
 		Logger()
 
 	if decision == DecisionKeep {
@@ -277,7 +277,7 @@ func (k *Keeper) checkUser(ctx context.Context, user storage.UserSession) Status
 	status.LastReloginAt = k.cfg.Now().UTC()
 	status.LastRefresh = status.LastReloginAt
 	status.ExpiresAt = ExpiresAt(storage.UserSession{SessionData: sessionData, LastRefresh: k.cfg.Now()}, k.cfg.SessionLifetime).UTC()
-	log.Info().Time("new_expires_at", status.ExpiresAt).Msg("session: re-login succeeded")
+	log.Info().Str("new_expires_at", status.ExpiresAt.Format(time.RFC3339)).Msg("session: re-login succeeded")
 	return status
 }
 
