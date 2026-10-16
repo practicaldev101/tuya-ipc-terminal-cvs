@@ -158,3 +158,22 @@ func TestCheckErrorIsReportedWithoutDegrading(t *testing.T) {
 		t.Fatalf("check_error must be omitted when empty: %s", raw)
 	}
 }
+
+func TestStartBackoffFields(t *testing.T) {
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	streams := fakeStreams{running: true, streams: []rtsp.StreamHealth{
+		{Device: "cam", RTSPPath: "/cam", Resolution: "sd", State: "stopped",
+			LastStartError: "failed to get app info: USER_SESSION_INVALID", NextStartAttemptAt: now.Add(4 * time.Second)},
+		{Device: "cam", RTSPPath: "/cam", Resolution: "hd", State: "active", StartedAt: now},
+	}}
+	doc := Build("0.0.6-cvs.4", streams, nil, now)
+	failed, healthy := doc.Streams[0], doc.Streams[1]
+	if failed.LastStartError != "failed to get app info: USER_SESSION_INVALID" ||
+		failed.NextStartAttemptAt == nil || *failed.NextStartAttemptAt != "2026-10-16T12:00:04Z" {
+		t.Fatalf("backoff fields not exported: %+v", failed)
+	}
+	body, _ := json.Marshal(healthy)
+	if strings.Contains(string(body), "last_start_error") || !strings.Contains(string(body), `"next_start_attempt_at":null`) {
+		t.Fatalf("healthy stream: last_start_error must be omitted and next_start_attempt_at null: %s", body)
+	}
+}

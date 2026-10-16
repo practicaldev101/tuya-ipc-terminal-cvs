@@ -55,6 +55,12 @@ type StreamDoc struct {
 	LastMediaAt     *string  `json:"last_media_at"`
 	LastAudioAt     *string  `json:"last_audio_at"`
 	MediaAgeSeconds *float64 `json:"media_age_seconds"`
+	// LastStartError: error of the last failed start since the last
+	// successful one (sanitized, no credentials).
+	LastStartError string `json:"last_start_error,omitempty"`
+	// NextStartAttemptAt: end of the start backoff; null when a client may
+	// start the stream now.
+	NextStartAttemptAt *string `json:"next_start_attempt_at"`
 }
 
 type SessionDoc struct {
@@ -105,6 +111,9 @@ func Build(version string, streams StreamSource, sessions SessionSource, now tim
 				StartedAt:   timeString(stream.StartedAt),
 				LastMediaAt: timeString(stream.LastMediaAt),
 				LastAudioAt: timeString(stream.LastAudioAt),
+
+				LastStartError:     stream.LastStartError,
+				NextStartAttemptAt: timeString(stream.NextStartAttemptAt),
 			}
 			if !stream.LastMediaAt.IsZero() {
 				age := now.Sub(stream.LastMediaAt).Seconds()
