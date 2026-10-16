@@ -3,8 +3,8 @@
 This is a pinned, patched fork of [seydx/tuya-ipc-terminal](https://github.com/seydx/tuya-ipc-terminal)
 (MIT) maintained for the Cloud Video Surveillance & Evidence Retention project.
 It bridges Tuya WebRTC cameras (initially a CORN CHM-302) to a local RTSP
-endpoint that FFmpeg records from. Branch: `cvs`. Releases: `v0.0.6-cvs.1`,
-`v0.0.6-cvs.3` (current; see [Changes in v0.0.6-cvs.3](#changes-in-v006-cvs3)).
+endpoint that FFmpeg records from. Branch: `cvs`. Releases: `v0.0.6-cvs.1`, `v0.0.6-cvs.3`,
+`v0.0.6-cvs.4` (current; see [Changes in v0.0.6-cvs.4](#changes-in-v006-cvs4)).
 
 Nothing in this repository is environment-specific: no credentials, cookies,
 IP addresses or `.tuya-data` files. Session state is created at runtime in
@@ -48,6 +48,33 @@ Nothing was skipped: none of the picks turned out redundant with PR #33.
 | `8b1cc52` | Pinned multi-stage `Dockerfile`, `.dockerignore`, `VERSION` = `0.0.6-cvs.1` (now a `var` so `-X main.VERSION=` works). |
 | `6442f3e` | CI (`ci.yml`: gofmt, build, vet, `test -race`, amd64+arm64 docker build) and release (`release.yml`: on `v*` tags push `ghcr.io/practicaldev101/tuya-ipc-terminal-cvs:<version>` and print the digest). Actions pinned by SHA. |
 
+## Changes in v0.0.6-cvs.4
+
+Observed on the test VPS (2026-10-16): the bridge's Tuya web session was
+invalidated by another login to the same account. Every RTSP reconnect then
+failed with `failed to get app info: USER_SESSION_INVALID` and called the Tuya
+API again (about every 130 ms, 671 times in ~90 s), while the session keeper
+only noticed at its next scheduled check (up to 6 h). Target: recovery from a
+session invalidation within 60 s.
+
+| Commit | Change |
+|---|---|
+| `c92ce5f` | `GetAppInfo`, `GetMQTTConfig` and `GetWebRTCConfig` return `*tuya.APIError` (message text unchanged) when Tuya answers with a non-200 status or `success: false`. `tuya.IsAPIRejection` applies the keeper's rule for an explicit rejection: HTTP 401/403 or `success: false`; transport errors, 5xx/429 and non-JSON bodies are not rejections. `WebRTCBridge.Start` wraps them with `%w`. |
+| `c37437f` | **Immediate session check on demand.** `Keeper.RequestCheck(user, reason)` makes `Run` check that user now (same validation / re-login / report-only / keep-validity-on-transport-error logic as the schedule, on the same goroutine, so checks never overlap). Rate-limited per user by `--session-recheck-min-interval` (default 30 s); requests are also dropped while the user's last re-login failed less than the retry interval (30 min) ago, so a wrong password cannot become a login loop. A result that needs an earlier retry pulls the next scheduled check in. Logs: `session: on-demand check requested` (WARN), `session: on-demand check` (INFO), then the usual `session: ...` lines. |
+| `83c79a0` | Data race fix: `acceptConnections` read `running` without the lock while `Stop` wrote it; the accept loop now exits on the server context. |
+| `2f80437` | **Stream start backoff.** After a failed start of a camera/resolution, new streams for it are refused for a window **without calling Tuya**: the RTSP client gets `503 Service Unavailable` with `CSeq` and `Retry-After` and the connection is closed. Window 1, 2, 4, 8, 16, 30 s (cap) per consecutive failure, cleared by a successful start; recorded before the failed stream's clients are disconnected, so their reconnect is already refused. One ERROR per real start attempt, `Failed to start WebRTC bridge for camera: <name> (next start attempt in <window>)` with fields `consecutive_failures`, `retry_in`; refused attempts log at debug only. A bridge stopped on purpose during startup (watchdog, shutdown) is not a start failure. A start rejected by Tuya (`IsAPIRejection`) calls `Keeper.RequestCheck` for the camera's user. |
+| `0eb09cf` | `/healthz` `streams[]`: `last_start_error` (omitempty; last failed start since the last success; URL userinfo redacted, max 256 bytes) and `next_start_attempt_at` (UTC RFC3339 end of the backoff, `null` when a client may start the stream now). A stream whose start failed stays listed (state `stopped`) after its stream object is gone. |
+| `30af11a` | `rtsp start` wiring and the `--session-recheck-min-interval` flag (env `TUYA_SESSION_RECHECK_MIN_INTERVAL`). |
+| (release) | `VERSION` = `0.0.6-cvs.4`. |
+
+Expected recovery after an invalidation (credentials configured): first
+failed start at t0 -> on-demand check and re-login immediately (one
+validation + one login, a few seconds) -> the next start is attempted at the
+end of the current window (1, 2, 4 or 8 s after the previous failure,
+depending on how many starts failed while the re-login ran) and reads the
+renewed session from disk. Tests cover the mechanics with fakes; the timing
+against the real Tuya API is not measured yet.
+
 ## Changes in v0.0.6-cvs.3
 
 | Commit | Change |
@@ -81,6 +108,7 @@ syntax (`20s`, `6h`) or integer seconds.
 | `--session-check-interval` | `TUYA_SESSION_CHECK_INTERVAL` | `6h` | Session validation period; `0` disables the keeper. |
 | `--session-renew-margin` | `TUYA_SESSION_RENEW_MARGIN` | `24h` | Renew this long before expected expiry. |
 | `--session-lifetime` | `TUYA_SESSION_LIFETIME` | `96h` | Assumed cookie lifetime when cookies carry no expiry. |
+| `--session-recheck-min-interval` | `TUYA_SESSION_RECHECK_MIN_INTERVAL` | `30s` | Minimum time between two immediate session checks of one user, triggered when Tuya rejects a stream start (cvs.4). `0` uses the default. |
 | `--credentials-file` | `TUYA_CREDENTIALS_FILE` | none | `KEY=VALUE` file with `TUYA_EMAIL`, `TUYA_PASSWORD`, optional `TUYA_REGION`; overrides the env vars below. |
 | | `TUYA_EMAIL`, `TUYA_PASSWORD`, `TUYA_REGION` | none | Re-login credentials. Matched to the stored session by email (case-insensitive) and region (if set). |
 | `--health-listen` | `TUYA_HEALTH_LISTEN` | off | Health endpoint address (`8556`, `:8556` -> `127.0.0.1:8556`). |
@@ -95,7 +123,7 @@ Local (Go 1.26.4; `go.mod` requires >= 1.24):
 
 ```bash
 CGO_ENABLED=0 go build -trimpath -buildvcs=false \
-  -ldflags "-s -w -X main.VERSION=0.0.6-cvs.3" -o tuya-ipc-terminal .
+  -ldflags "-s -w -X main.VERSION=0.0.6-cvs.4" -o tuya-ipc-terminal .
 go vet ./... && go test -race ./...
 ```
 
@@ -107,7 +135,7 @@ Docker (base images pinned by digest in the `Dockerfile`):
 | runtime | `gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab` |
 
 ```bash
-docker build -t tuya-ipc-terminal-cvs:0.0.6-cvs.3 .
+docker build -t tuya-ipc-terminal-cvs:0.0.6-cvs.4 .
 ```
 
 The runtime image runs as uid/gid 65532, working directory and volume `/data`
@@ -143,13 +171,13 @@ docker run -d --name tuya-bridge --network host \
   -v tuya-data:/data \
   -v /etc/tuya-bridge/credentials.env:/run/secrets/tuya.env:ro \
   -e TUYA_CREDENTIALS_FILE=/run/secrets/tuya.env \
-  tuya-ipc-terminal-cvs:0.0.6-cvs.3 \
+  tuya-ipc-terminal-cvs:0.0.6-cvs.4 \
   rtsp start --listen 127.0.0.1 --port 8554 --health-listen 8556
 ```
 
 The first `auth add` / `cameras refresh` can be run with the same image and
 volume (`docker run --rm -it --network host -v tuya-data:/data
-tuya-ipc-terminal-cvs:0.0.6-cvs.3 auth add ...`).
+tuya-ipc-terminal-cvs:0.0.6-cvs.4 auth add ...`).
 
 ## Known limitations
 
@@ -176,7 +204,12 @@ tuya-ipc-terminal-cvs:0.0.6-cvs.3 auth add ...`).
   MQTT/WebRTC session of a stream that is already running; running streams
   keep their session, new streams read the refreshed session from disk.
 - **Health is on-demand:** streams only exist while an RTSP client is
-  attached, so `/healthz` lists streams the recorder is currently pulling.
+  attached, so `/healthz` lists streams the recorder is currently pulling
+  (plus, since cvs.4, streams whose last start failed).
+- **Start backoff is per bridge process** and not persisted; a restart
+  starts without backoff. Refused clients still cost one TCP accept and one
+  RTSP exchange each (no Tuya call); how fast a recorder reconnects after a
+  503 is up to the recorder.
 - Not validated yet against real hardware with these patches; long-run
   behaviour (24-72 h endurance, HD, five concurrent cameras) is untested.
 - Logs are human-readable zerolog console lines at trace level (upstream
