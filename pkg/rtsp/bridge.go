@@ -366,10 +366,10 @@ func (wb *WebRTCBridge) setupPeerConnection(webRTCConfig *tuya.WebRTCConfig) err
 			core.Logger.Info().Msgf("WebRTC connection established")
 
 			if !wb.isHEVC {
-				// CVS: for sd, only send a clarity when the device advertised its
-				// supported values; pickVideoClarity falls back to 0, which is the
-				// legacy "hd" value and would switch an sd stream to the main stream.
-				if wb.resolution == "hd" || len(wb.videoClarities) > 0 {
+				// CVS: never send a clarity for sd. On the CORN CHM-302 (clarities [2 4])
+				// clarity 2 switches the H.264 sd track to HEVC NAL units while the SDP
+				// still says H.264, so nothing can decode it (observed 2026-10-16).
+				if wb.resolution == "hd" {
 					clarity := pickVideoClarity(wb.videoClarities, wb.resolution)
 					core.Logger.Info().Msgf("Sending video clarity %d for %s (supported: %v)", clarity, wb.resolution, wb.videoClarities)
 					_ = wb.cameraClient.SendResolution(clarity)
