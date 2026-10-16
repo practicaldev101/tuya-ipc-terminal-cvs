@@ -37,8 +37,16 @@ type RTSPServer struct {
 	// ICE/TURN) can legitimately take longer than the media timeout.
 	// <= 0 uses mediaTimeout.
 	startupTimeout time.Duration
-	// now is the watchdog clock (overridable in tests).
+	// now is the watchdog and start backoff clock (overridable in tests).
 	now func() time.Time
+
+	// startBackoffs holds the start failure state per stream id
+	// (backoff.go); guarded by mutex.
+	startBackoffs map[string]*startBackoff
+	// onSessionRejected is called when Tuya rejects a stream start.
+	onSessionRejected SessionRejectedFunc
+	// startBridge replaces WebRTCBridge.Start (tests only).
+	startBridge func(cs *CameraStream) error
 }
 
 type RTSPClient struct {
@@ -129,6 +137,7 @@ func NewRTSPServer(address string, port int, storageManager *storage.StorageMana
 		ctx:            ctx,
 		cancel:         cancel,
 		running:        false,
+		startBackoffs:  make(map[string]*startBackoff),
 		mediaTimeout:   DefaultMediaTimeout,
 		startupTimeout: DefaultStartupTimeout,
 		now:            time.Now,
@@ -337,6 +346,19 @@ func (s *RTSPServer) handleConnection(conn net.Conn) {
 	var stream *CameraStream
 	for attempt := 0; attempt < 2 && stream == nil; attempt++ {
 		candidate, err := s.getOrCreateStream(camera, streamResolution, user)
+		var backoff *errStartBackoff
+		if errors.As(err, &backoff) {
+			// Fail fast without touching Tuya; the failure itself was
+			// logged once when the start failed.
+			retryAfter := backoff.retryAfterSeconds(s.clock())
+			core.Logger.Debug().Str("device", camera.DeviceName).Str("resolution", streamResolution).
+				Int("retry_after", retryAfter).Msgf("Stream start backing off, refusing RTSP client session=%s", session)
+			sendRTSPResponse(conn, 503, "Service Unavailable", map[string]string{
+				"CSeq":        strconv.Itoa(request.CSeq),
+				"Retry-After": strconv.Itoa(retryAfter),
+			}, "")
+			return
+		}
 		if err != nil {
 			core.Logger.Error().Err(err).Msgf("Failed to create stream for camera %s", camera.DeviceName)
 			sendRTSPResponse(conn, 500, "Internal Server Error", nil, "Failed to create stream")
@@ -439,6 +461,12 @@ func (s *RTSPServer) getOrCreateStream(camera *storage.CameraInfo, streamResolut
 			core.Logger.Trace().Msgf("Reusing existing stream for camera: %s", camera.DeviceName)
 			return stream, nil
 		}
+	}
+
+	// A new stream means a new start: refuse it while the last start of
+	// this camera/resolution failed recently.
+	if err := s.checkStartBackoffLocked(streamId); err != nil {
+		return nil, err
 	}
 
 	// Create new stream
@@ -663,19 +691,42 @@ func (cs *CameraStream) Stop() {
 }
 
 func (cs *CameraStream) startStream() {
-	cs.startStreamWith(cs.webrtcBridge.Start)
+	start := cs.webrtcBridge.Start
+	if cs.server != nil && cs.server.startBridge != nil {
+		start = func() error { return cs.server.startBridge(cs) }
+	}
+	cs.startStreamWith(start)
 }
 
 func (cs *CameraStream) startStreamWith(startBridge func() error) {
 	core.Logger.Info().Msgf("Starting stream for camera: %s", cs.camera.DeviceName)
 
 	if err := startBridge(); err != nil {
-		core.Logger.Error().Err(err).Msgf("Failed to start WebRTC bridge for camera: %s", cs.camera.DeviceName)
+		switch {
+		case errors.Is(err, errBridgeStopped):
+			// Stopped on purpose (watchdog, shutdown): not a failed start.
+			core.Logger.Info().Msgf("Stream for camera %s stopped during startup", cs.camera.DeviceName)
+		case cs.server != nil:
+			// Record the backoff before teardown so the reconnect that the
+			// teardown provokes is already refused.
+			failures, retryIn := cs.server.recordStartFailure(cs, err)
+			logStartFailure(cs, err, failures, retryIn)
+			cs.server.reportSessionRejected(cs.user, err)
+		default:
+			core.Logger.Error().Err(err).Msgf("Failed to start WebRTC bridge for camera: %s", cs.camera.DeviceName)
+		}
 		// Disconnect attached RTSP clients too: upstream left them attached
 		// to a stream that would never deliver media, so recorders hung
 		// instead of reconnecting.
 		cs.teardown()
 		return
+	}
+
+	if cs.server != nil {
+		if failures := cs.server.recordStartSuccess(cs.streamId); failures > 0 {
+			core.Logger.Info().Int("previous_failures", failures).
+				Msgf("Stream for camera %s started after %d failed attempts, start backoff cleared", cs.camera.DeviceName, failures)
+		}
 	}
 
 	cs.mutex.Lock()

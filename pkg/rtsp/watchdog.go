@@ -215,19 +215,40 @@ type StreamHealth struct {
 	StartedAt   time.Time
 	LastMediaAt time.Time // last video RTP packet (zero: none yet)
 	LastAudioAt time.Time
+
+	// LastStartError is the (sanitized) error of the last failed start
+	// since the last successful one ("" if none).
+	LastStartError string
+	// NextStartAttemptAt is when the start backoff ends (zero: no backoff
+	// in effect, a client may start the stream now).
+	NextStartAttemptAt time.Time
 }
 
 // StreamsHealth returns the state of every stream currently known to the
-// server (streams exist while RTSP clients are attached or shortly after).
+// server (streams exist while RTSP clients are attached or shortly after)
+// plus, as "stopped", streams whose last start failed and that have no live
+// stream right now.
 func (s *RTSPServer) StreamsHealth() []StreamHealth {
+	now := s.clock()
 	s.mutex.RLock()
 	streams := make([]*CameraStream, 0, len(s.streams))
 	for _, stream := range s.streams {
 		streams = append(streams, stream)
 	}
+	backoffs := make(map[string]startBackoff, len(s.startBackoffs))
+	for id, entry := range s.startBackoffs {
+		backoffs[id] = *entry
+	}
 	s.mutex.RUnlock()
 
-	result := make([]StreamHealth, 0, len(streams))
+	applyBackoff := func(health *StreamHealth, entry startBackoff) {
+		health.LastStartError = entry.lastError
+		if now.Before(entry.nextAttemptAt) {
+			health.NextStartAttemptAt = entry.nextAttemptAt
+		}
+	}
+
+	result := make([]StreamHealth, 0, len(streams)+len(backoffs))
 	for _, stream := range streams {
 		stream.mutex.RLock()
 		health := StreamHealth{
@@ -255,6 +276,21 @@ func (s *RTSPServer) StreamsHealth() []StreamHealth {
 			health.State = "stopped"
 		}
 		stream.mutex.RUnlock()
+		if entry, ok := backoffs[stream.streamId]; ok {
+			applyBackoff(&health, entry)
+			delete(backoffs, stream.streamId)
+		}
+		result = append(result, health)
+	}
+	for _, entry := range backoffs {
+		health := StreamHealth{
+			Device:     entry.device,
+			DeviceID:   entry.deviceID,
+			RTSPPath:   entry.rtspPath,
+			Resolution: entry.resolution,
+			State:      "stopped",
+		}
+		applyBackoff(&health, entry)
 		result = append(result, health)
 	}
 
