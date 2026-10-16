@@ -6,8 +6,8 @@
 
 > **CVS fork.** This is the `cvs` branch of
 > [practicaldev101/tuya-ipc-terminal-cvs](https://github.com/practicaldev101/tuya-ipc-terminal-cvs),
-> a pinned fork of upstream PR #33 plus selected fixes, a media watchdog,
-> automatic session renewal, a loopback health endpoint and a pinned Docker
+> a pinned fork of upstream PR #33 plus selected fixes, a media watchdog
+> (with a separate startup grace), automatic session renewal, a loopback health endpoint and a pinned Docker
 > build. The RTSP server listens on `127.0.0.1` by default. See
 > [CVS-CHANGES.md](CVS-CHANGES.md) for the exact changes, flags, build and
 > run instructions, and known limitations.

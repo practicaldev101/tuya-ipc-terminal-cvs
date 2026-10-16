@@ -36,7 +36,7 @@ func TestBuildDocument(t *testing.T) {
 	}}}
 	sessions := fakeSessions{{UserKey: "eu-central_x", Region: "eu-central", Valid: true, ExpiresAt: now.Add(48 * time.Hour)}}
 
-	doc := Build("0.0.6-cvs.1", streams, sessions, now)
+	doc := Build("0.0.6-cvs.2", streams, sessions, now)
 
 	if doc.Status != "ok" || !doc.RTSPRunning || !doc.SessionKeeper || doc.MediaTimeoutSeconds != 20 {
 		t.Fatalf("unexpected document: %+v", doc)
