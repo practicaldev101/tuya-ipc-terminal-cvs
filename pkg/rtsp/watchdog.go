@@ -132,7 +132,7 @@ func (cs *CameraStream) markDeadIfStalled(now time.Time, timeout time.Duration) 
 	return idle, len(cs.clients), true
 }
 
-// teardown stops the stream for good: it detaches and disconnects every RTSP
+// teardown stops the stream for good: it disconnects and detaches every RTSP
 // client (so recorders see EOF and reconnect), removes the stream from the
 // server map and stops the WebRTC bridge (peer connection, MQTT, forwarder).
 // Safe to call more than once and from any goroutine not holding cs.mutex.
@@ -147,20 +147,30 @@ func (cs *CameraStream) teardown() {
 		cs.shutdownTimer = nil
 	}
 	clients := make([]*RTSPClient, 0, len(cs.clients))
-	for sessionID, client := range cs.clients {
+	for _, client := range cs.clients {
 		clients = append(clients, client)
+	}
+	cs.mutex.Unlock()
+
+	// Close the client connections before removing the clients: removal
+	// needs the forwarder's write lock, and a forwarder write blocked on a
+	// client that stopped reading holds its read lock. Closing the
+	// connection unblocks that write immediately. (dead is already set, so
+	// no client can attach in between.)
+	for _, client := range clients {
+		if client.conn != nil {
+			_ = client.conn.Close()
+		}
+	}
+
+	cs.mutex.Lock()
+	for sessionID := range cs.clients {
 		cs.removeClientLocked(sessionID, false)
 	}
 	cs.mutex.Unlock()
 
 	if cs.server != nil {
 		cs.server.removeStream(cs.streamId, cs)
-	}
-
-	for _, client := range clients {
-		if client.conn != nil {
-			_ = client.conn.Close()
-		}
 	}
 
 	if cs.webrtcBridge != nil {

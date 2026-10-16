@@ -1,6 +1,7 @@
 package rtsp
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -22,9 +23,20 @@ const (
 	TransportTCP               // Interleaved
 )
 
+// tcpWriteTimeout bounds one interleaved RTP write to a TCP client (CVS
+// patch). A client that stops reading fills its socket buffer; without a
+// deadline the write blocks indefinitely while holding rf.mutex (read
+// lock), which in turn blocks RemoveClient and therefore stream teardown.
+// A write that times out drops that client.
+const tcpWriteTimeout = 5 * time.Second
+
 type RTPForwarder struct {
 	clients map[string]*RTPClient
 	mutex   sync.RWMutex
+
+	// tcpWriteTimeout is the per-write deadline for TCP interleaved
+	// clients (tcpWriteTimeout; shortened in tests, <= 0 disables).
+	tcpWriteTimeout time.Duration
 
 	// RTP session info
 	videoSSRC atomic.Uint32
@@ -78,12 +90,20 @@ type RTPClient struct {
 	videoRTPChannel     byte
 	audioRTPChannel     byte
 	backAudioRTPChannel byte
+	// tcpWriteMutex serializes forwarder writes (video and audio arrive on
+	// different goroutines) so each write's deadline is set and cleared
+	// around that write only.
+	tcpWriteMutex sync.Mutex
+	// dropped is set once a TCP write failed or timed out: the connection
+	// has been closed (its interleaved framing may be broken) and the RTSP
+	// handler removes the client; until then packets are skipped.
+	dropped atomic.Bool
 
 	lastActivity atomic.Int64
 }
 
 func NewRTPForwarder() *RTPForwarder {
-	forwarder := &RTPForwarder{clients: make(map[string]*RTPClient)}
+	forwarder := &RTPForwarder{clients: make(map[string]*RTPClient), tcpWriteTimeout: tcpWriteTimeout}
 	forwarder.audioSSRC.Store(1)
 	forwarder.firstVideoPacket.Store(true)
 	forwarder.firstAudioPacket.Store(true)
@@ -332,10 +352,8 @@ func (rf *RTPForwarder) ForwardVideoPacket(packet *rtp.Packet) {
 				}
 			}
 		} else if client.transportMode == TransportTCP {
-			if client.tcpConn != nil {
-				if err := rf.sendInterleavedRTP(client.tcpConn, client.videoRTPChannel, data); err != nil {
-					core.Logger.Error().Err(err).Msgf("Error forwarding video packet to TCP client %s", sessionID)
-				} else if rf.firstVideoPacket.CompareAndSwap(true, false) {
+			if client.tcpConn != nil && !client.dropped.Load() {
+				if err := rf.writeInterleaved(client, client.videoRTPChannel, data); err == nil && rf.firstVideoPacket.CompareAndSwap(true, false) {
 					core.Logger.Trace().Msgf("Successfully sent first video RTP packet to TCP client %s on channel %d (PT %d->96, SSRC %d, sequence %d, timestamp %d, %d bytes)",
 						sessionID, client.videoRTPChannel, packet.PayloadType, packet.SSRC, packet.SequenceNumber, packet.Timestamp, len(data))
 				}
@@ -375,10 +393,8 @@ func (rf *RTPForwarder) ForwardAudioPacket(packet *rtp.Packet) {
 				}
 			}
 		} else if client.transportMode == TransportTCP {
-			if client.tcpConn != nil {
-				if err := rf.sendInterleavedRTP(client.tcpConn, client.audioRTPChannel, data); err != nil {
-					core.Logger.Error().Err(err).Msgf("Error forwarding audio packet to TCP client %s", sessionID)
-				} else if rf.firstAudioPacket.CompareAndSwap(true, false) {
+			if client.tcpConn != nil && !client.dropped.Load() {
+				if err := rf.writeInterleaved(client, client.audioRTPChannel, data); err == nil && rf.firstAudioPacket.CompareAndSwap(true, false) {
 					core.Logger.Trace().Msgf("Successfully sent first audio packet to TCP client %s on channel %d",
 						sessionID, client.audioRTPChannel)
 				}
@@ -511,6 +527,41 @@ func (rf *RTPForwarder) handleUDPBackchannelRTCP(listener *net.UDPConn) {
 
 		// Simply discard RTCP packets
 	}
+}
+
+// writeInterleaved sends one interleaved RTP packet to a TCP client with a
+// write deadline. On any write error (timeout included) the client is
+// dropped: its connection is closed, which also ends its RTSP session (the
+// handler then removes it from the stream and this forwarder). Safe to call
+// while holding rf.mutex for reading.
+func (rf *RTPForwarder) writeInterleaved(client *RTPClient, channel byte, rtpData []byte) error {
+	client.tcpWriteMutex.Lock()
+	defer client.tcpWriteMutex.Unlock()
+
+	if client.dropped.Load() {
+		return net.ErrClosed
+	}
+	if rf.tcpWriteTimeout > 0 {
+		_ = client.tcpConn.SetWriteDeadline(time.Now().Add(rf.tcpWriteTimeout))
+	}
+	err := rf.sendInterleavedRTP(client.tcpConn, channel, rtpData)
+	if rf.tcpWriteTimeout > 0 && err == nil {
+		// Do not leave a stale deadline behind for RTSP responses written
+		// later on the same connection by the protocol handler.
+		_ = client.tcpConn.SetWriteDeadline(time.Time{})
+	}
+	if err != nil && client.dropped.CompareAndSwap(false, true) {
+		event := core.Logger.Error()
+		reason := "write failed"
+		if netErr := net.Error(nil); errors.As(err, &netErr) && netErr.Timeout() {
+			event = core.Logger.Warn()
+			reason = fmt.Sprintf("not reading (write blocked for %v)", rf.tcpWriteTimeout)
+		}
+		event.Err(err).Str("component", "forwarder").Str("session", client.sessionID).
+			Msgf("Dropping TCP RTP client %s: %s", client.sessionID, reason)
+		_ = client.tcpConn.Close()
+	}
+	return err
 }
 
 func (rf *RTPForwarder) sendInterleavedRTP(conn net.Conn, channel byte, rtpData []byte) error {
