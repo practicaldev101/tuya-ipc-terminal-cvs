@@ -2,10 +2,15 @@ package session
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"sync"
 	"time"
 
 	"golang.org/x/net/publicsuffix"
@@ -50,8 +55,14 @@ func NewHTTPClient(sessionData *tuya.SessionData) (*http.Client, error) {
 }
 
 // TuyaValidate checks a session by calling an authenticated endpoint (the
-// same call `auth test` uses).
+// same call `auth test` uses). Failures that are not an answer about the
+// session (transport errors, HTTP status other than 200/401/403, unparsable
+// body) are marked Transient.
 func TuyaValidate(ctx context.Context, sessionData *tuya.SessionData) error {
+	return validateWith(ctx, sessionData, http.DefaultTransport)
+}
+
+func validateWith(ctx context.Context, sessionData *tuya.SessionData, transport http.RoundTripper) error {
 	if sessionData == nil {
 		return fmt.Errorf("no session data")
 	}
@@ -59,10 +70,75 @@ func TuyaValidate(ctx context.Context, sessionData *tuya.SessionData) error {
 	if err != nil {
 		return err
 	}
-	return runWithContext(ctx, func() error {
+	recorder := &statusRecorder{base: transport}
+	client.Transport = recorder
+	err = runWithContext(ctx, func() error {
 		_, err := tuya.GetAppInfo(client, sessionData.ServerHost)
-		return err
+		return classifyValidationError(err, recorder.lastStatus())
 	})
+	if err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		return Transient(err)
+	}
+	return err
+}
+
+// classifyValidationError decides whether a failed app-info call is an
+// explicit session rejection (returned as is) or a failed check (marked
+// Transient). status is the last HTTP status received (0: none).
+func classifyValidationError(err error, status int) error {
+	if err == nil {
+		return nil
+	}
+	var netErr net.Error
+	var urlErr *url.Error
+	var syntaxErr *json.SyntaxError
+	var typeErr *json.UnmarshalTypeError
+	switch {
+	case errors.As(err, &urlErr), errors.As(err, &netErr), errors.Is(err, io.ErrUnexpectedEOF):
+		// DNS failure, timeout, connection refused/reset, TLS, ...
+		return Transient(err)
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return err
+	case status != 0 && status != http.StatusOK:
+		// 5xx, 429 and other statuses that are no verdict on the session.
+		return Transient(err)
+	case errors.As(err, &syntaxErr), errors.As(err, &typeErr):
+		// HTTP 200 with a body that is not the API's JSON (proxy/CDN page).
+		return Transient(err)
+	default:
+		// The API answered success=false: the session was rejected.
+		if err.Error() == "" {
+			return errors.New("session rejected by Tuya (success=false)")
+		}
+		return err
+	}
+}
+
+// statusRecorder remembers the status code of the last HTTP response.
+type statusRecorder struct {
+	base   http.RoundTripper
+	mutex  sync.Mutex
+	status int
+}
+
+func (r *statusRecorder) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := r.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	resp, err := base.RoundTrip(req)
+	if err == nil {
+		r.mutex.Lock()
+		r.status = resp.StatusCode
+		r.mutex.Unlock()
+	}
+	return resp, err
+}
+
+func (r *statusRecorder) lastStatus() int {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	return r.status
 }
 
 // RegionLookup resolves a region name (e.g. "eu-central") to its endpoint.

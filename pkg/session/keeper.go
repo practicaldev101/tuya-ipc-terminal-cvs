@@ -6,6 +6,12 @@
 // starting. The Keeper periodically validates every stored session and, when
 // it is invalid or close to its (stored or assumed) expiry, re-logs in
 // non-interactively with operator-supplied credentials.
+//
+// Only an explicit rejection by Tuya marks a session invalid. A check that
+// fails for transport or server reasons (DNS, timeout, connection refused,
+// HTTP 5xx, ...) says nothing about the session: the previous validity is
+// kept, the failure is reported as check_error and the check is retried
+// after CheckErrorRetryInterval.
 package session
 
 import (
@@ -26,7 +32,10 @@ const (
 	DefaultRenewMargin     = 24 * time.Hour
 	DefaultSessionLifetime = 96 * time.Hour // observed Tuya web cookie lifetime (~4 days)
 	DefaultRetryInterval   = 30 * time.Minute
-	minDelay               = time.Minute
+	// DefaultCheckErrorRetryInterval: next check after a validation that
+	// failed for transport/server reasons.
+	DefaultCheckErrorRetryInterval = 5 * time.Minute
+	minDelay                       = time.Minute
 )
 
 // Store is the subset of storage.StorageManager used by the keeper.
@@ -35,8 +44,32 @@ type Store interface {
 	SaveUser(region, email string, sessionData *tuya.SessionData) error
 }
 
-// ValidateFunc returns nil when the stored session is accepted by Tuya.
+// ValidateFunc returns nil when the stored session is accepted by Tuya. An
+// error marked with Transient means the check itself failed (transport or
+// server error) and says nothing about the session; any other error is an
+// explicit rejection of the session.
 type ValidateFunc func(ctx context.Context, sessionData *tuya.SessionData) error
+
+type transientError struct{ err error }
+
+func (e *transientError) Error() string { return e.err.Error() }
+func (e *transientError) Unwrap() error { return e.err }
+
+// Transient marks err as a failed check (not a verdict on the session).
+func Transient(err error) error {
+	if err == nil || IsTransient(err) {
+		return err
+	}
+	return &transientError{err: err}
+}
+
+// IsTransient reports whether err is a failed check rather than a session
+// rejection. Context cancellation and deadline errors count as transient.
+func IsTransient(err error) bool {
+	var transient *transientError
+	return errors.As(err, &transient) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
 
 // LoginFunc performs a non-interactive email/password login.
 type LoginFunc func(ctx context.Context, region, email, password string) (*tuya.SessionData, error)
@@ -47,8 +80,11 @@ type Config struct {
 	RenewMargin     time.Duration // re-login this long before expiry
 	SessionLifetime time.Duration // assumed lifetime when cookies carry no expiry
 	RetryInterval   time.Duration // next check after a failed re-login
-	Credentials     *Credentials  // nil: cannot re-login, only report
-	Now             func() time.Time
+	// CheckErrorRetryInterval is the next check after a validation that
+	// failed for transport/server reasons.
+	CheckErrorRetryInterval time.Duration
+	Credentials             *Credentials // nil: cannot re-login, only report
+	Now                     func() time.Time
 }
 
 // Status is the last known state of one stored user session.
@@ -62,6 +98,10 @@ type Status struct {
 	LastReloginAt         time.Time `json:"last_relogin_at,omitempty"`
 	CredentialsConfigured bool      `json:"credentials_configured"`
 	Error                 string    `json:"error,omitempty"`
+	// CheckError is set when the last validation could not be completed
+	// (transport/server error); Valid and Error then carry the previous
+	// result.
+	CheckError string `json:"check_error,omitempty"`
 }
 
 // Keeper validates and renews stored sessions.
@@ -89,6 +129,9 @@ func NewKeeper(cfg Config, store Store, validate ValidateFunc, login LoginFunc) 
 	}
 	if cfg.RetryInterval <= 0 {
 		cfg.RetryInterval = DefaultRetryInterval
+	}
+	if cfg.CheckErrorRetryInterval <= 0 {
+		cfg.CheckErrorRetryInterval = DefaultCheckErrorRetryInterval
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -188,6 +231,10 @@ func (k *Keeper) CheckAll(ctx context.Context) time.Duration {
 		if status.Error != "" && status.CredentialsConfigured && k.cfg.RetryInterval < next {
 			next = k.cfg.RetryInterval
 		}
+		// A check that could not reach a verdict is retried soon.
+		if status.CheckError != "" && k.cfg.CheckErrorRetryInterval < next {
+			next = k.cfg.CheckErrorRetryInterval
+		}
 		// Wake up in time to renew when the margin is reached before the
 		// next regular check.
 		if !status.ExpiresAt.IsZero() {
@@ -214,7 +261,8 @@ func (k *Keeper) checkUser(ctx context.Context, user storage.UserSession) Status
 		ExpiresAt:             ExpiresAt(user, k.cfg.SessionLifetime).UTC(),
 		CredentialsConfigured: k.cfg.Credentials.Matches(user.Region, user.Email),
 	}
-	if previous, ok := k.getStatus(user.UserKey); ok {
+	previous, hasPrevious := k.getStatus(user.UserKey)
+	if hasPrevious {
 		status.LastReloginAt = previous.LastReloginAt
 	}
 
@@ -225,13 +273,36 @@ func (k *Keeper) checkUser(ctx context.Context, user storage.UserSession) Status
 		validationErr = k.validate(ctx, user.SessionData)
 	}
 
-	decision := Decide(now, status.ExpiresAt, k.cfg.RenewMargin, validationErr)
 	log := core.Logger.With().
 		Str("component", "session").
 		Str("user", user.UserKey).
 		Str("region", user.Region).
 		Str("expires_at", status.ExpiresAt.Format(time.RFC3339)).
 		Logger()
+
+	if validationErr != nil && IsTransient(validationErr) {
+		// The check failed, not the session: it is no verdict.
+		checkErr := validationErr
+		status.CheckError = checkErr.Error()
+		validationErr = nil
+		if Decide(now, status.ExpiresAt, k.cfg.RenewMargin, nil) == DecisionKeep {
+			// Keep the last verdict (before the first one: valid, as the
+			// session is not expired), do not re-login, retry soon.
+			status.Valid = true
+			if hasPrevious {
+				status.Valid = previous.Valid
+				status.Error = previous.Error
+			}
+			log.Warn().Err(checkErr).Bool("valid", status.Valid).Dur("retry_in", k.cfg.CheckErrorRetryInterval).
+				Msg("session: validation check failed (transport/server error), keeping previous validity")
+			return status
+		}
+		// Expiring or expired by the clock: that decision does not depend
+		// on the failed check, so renew (or report) as usual.
+		log.Warn().Err(checkErr).Msg("session: validation check failed (transport/server error); session expiring by the clock")
+	}
+
+	decision := Decide(now, status.ExpiresAt, k.cfg.RenewMargin, validationErr)
 
 	if decision == DecisionKeep {
 		status.Valid = true
@@ -274,6 +345,7 @@ func (k *Keeper) checkUser(ctx context.Context, user storage.UserSession) Status
 
 	status.Valid = true
 	status.Error = ""
+	status.CheckError = "" // the new session was validated
 	status.LastReloginAt = k.cfg.Now().UTC()
 	status.LastRefresh = status.LastReloginAt
 	status.ExpiresAt = ExpiresAt(storage.UserSession{SessionData: sessionData, LastRefresh: k.cfg.Now()}, k.cfg.SessionLifetime).UTC()

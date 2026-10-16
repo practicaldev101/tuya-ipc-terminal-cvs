@@ -67,6 +67,9 @@ type SessionDoc struct {
 	LastReloginAt         *string `json:"last_relogin_at"`
 	CredentialsConfigured bool    `json:"credentials_configured"`
 	Error                 string  `json:"error,omitempty"`
+	// CheckError: the last validation failed for transport/server reasons;
+	// valid/error carry the previous result. Does not degrade the status.
+	CheckError string `json:"check_error,omitempty"`
 }
 
 func timeString(t time.Time) *string {
@@ -127,6 +130,7 @@ func Build(version string, streams StreamSource, sessions SessionSource, now tim
 				LastReloginAt:         timeString(status.LastReloginAt),
 				CredentialsConfigured: status.CredentialsConfigured,
 				Error:                 status.Error,
+				CheckError:            status.CheckError,
 			})
 			if (!status.Valid || status.Error != "") && doc.Status == "ok" {
 				doc.Status = "degraded"

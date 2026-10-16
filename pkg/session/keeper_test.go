@@ -53,12 +53,17 @@ func (s *fakeStore) SaveUser(region, email string, sessionData *tuya.SessionData
 
 type fakeTuya struct {
 	validSessions map[*tuya.SessionData]bool
+	validateErr   error // when set, returned when validating a stored (not freshly logged-in) session
+	fresh         map[*tuya.SessionData]bool
 	loginErr      error
 	logins        int
 	lastPassword  string
 }
 
 func (f *fakeTuya) validate(_ context.Context, sd *tuya.SessionData) error {
+	if f.validateErr != nil && !f.fresh[sd] {
+		return f.validateErr
+	}
 	if f.validSessions[sd] {
 		return nil
 	}
@@ -73,6 +78,10 @@ func (f *fakeTuya) login(_ context.Context, region, email, password string) (*tu
 	}
 	sd := &tuya.SessionData{Region: region, UserEmail: email, ServerHost: "example.invalid"}
 	f.validSessions[sd] = true
+	if f.fresh == nil {
+		f.fresh = make(map[*tuya.SessionData]bool)
+	}
+	f.fresh[sd] = true
 	return sd, nil
 }
 
@@ -294,5 +303,120 @@ func TestLoadCredentials(t *testing.T) {
 
 	if _, err := LoadCredentials(filepath.Join(t.TempDir(), "missing"), getenv); err == nil {
 		t.Fatal("missing credentials file must be an error")
+	}
+}
+
+var errDNS = Transient(errors.New(`Post "https://example.invalid/api/customized/web/app/info": dial tcp: lookup example.invalid: no such host`))
+
+func TestTransientCheckErrorKeepsPreviousValidity(t *testing.T) {
+	keeper, store, api, clock := setup(t, time.Hour, true, testCreds)
+	keeper.CheckAll(context.Background())
+	if !keeper.Statuses()[0].Valid {
+		t.Fatal("precondition: session valid")
+	}
+
+	api.validateErr = errDNS
+	clock.Advance(6 * time.Hour)
+	next := keeper.CheckAll(context.Background())
+
+	if api.logins != 0 || len(store.saved) != 0 {
+		t.Fatalf("transport error triggered re-login (logins=%d saves=%d)", api.logins, len(store.saved))
+	}
+	if next != DefaultCheckErrorRetryInterval {
+		t.Fatalf("next check in %v, want short retry %v", next, DefaultCheckErrorRetryInterval)
+	}
+	status := keeper.Statuses()[0]
+	if !status.Valid || status.Error != "" || status.CheckError == "" {
+		t.Fatalf("transport error must keep valid=true and set check_error only: %+v", status)
+	}
+	if !status.CheckedAt.Equal(clock.Now()) {
+		t.Fatalf("checked_at not updated: %v", status.CheckedAt)
+	}
+
+	// Next successful check clears check_error and returns to the interval.
+	api.validateErr = nil
+	clock.Advance(DefaultCheckErrorRetryInterval)
+	if next := keeper.CheckAll(context.Background()); next != DefaultCheckInterval {
+		t.Fatalf("next check in %v after recovery, want %v", next, DefaultCheckInterval)
+	}
+	if status := keeper.Statuses()[0]; !status.Valid || status.CheckError != "" {
+		t.Fatalf("check_error not cleared after a successful check: %+v", status)
+	}
+}
+
+func TestTransientCheckErrorKeepsPreviousInvalidity(t *testing.T) {
+	keeper, _, api, _ := setup(t, time.Hour, false, nil)
+	keeper.CheckAll(context.Background())
+	before := keeper.Statuses()[0]
+	if before.Valid || before.Error == "" {
+		t.Fatalf("precondition: invalid session with error, got %+v", before)
+	}
+
+	api.validateErr = Transient(errors.New("HTTP error: 503 - Service Unavailable"))
+	keeper.CheckAll(context.Background())
+	status := keeper.Statuses()[0]
+	if status.Valid || status.Error != before.Error || status.CheckError == "" {
+		t.Fatalf("transport error must keep the previous verdict: %+v", status)
+	}
+}
+
+func TestTransientCheckErrorBeforeFirstVerdictUsesExpiryEstimate(t *testing.T) {
+	keeper, _, api, _ := setup(t, time.Hour, false, testCreds)
+	api.validateErr = errDNS
+	keeper.CheckAll(context.Background())
+	status := keeper.Statuses()[0]
+	if api.logins != 0 {
+		t.Fatal("transport error triggered re-login")
+	}
+	if !status.Valid || status.CheckError == "" {
+		t.Fatalf("young session with failed first check should be reported valid by expiry: %+v", status)
+	}
+
+}
+
+// A failed check does not hide that the session expired (or is about to)
+// by the clock: without credentials it is reported invalid, with
+// credentials it is renewed as usual.
+func TestTransientCheckErrorDoesNotHideExpiry(t *testing.T) {
+	keeper, _, api, _ := setup(t, time.Hour, true, nil)
+	keeper.CheckAll(context.Background())
+	api.validateErr = errDNS
+	keeper.cfg.Now = func() time.Time { return time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC).Add(100 * time.Hour) }
+	keeper.CheckAll(context.Background())
+	if status := keeper.Statuses()[0]; status.Valid || status.Error == "" || status.CheckError == "" || api.logins != 0 {
+		t.Fatalf("expired session must be reported invalid: %+v logins=%d", status, api.logins)
+	}
+
+	keeper, store, api, _ := setup(t, 80*time.Hour, true, testCreds)
+	api.validateErr = errDNS
+	keeper.CheckAll(context.Background())
+	status := keeper.Statuses()[0]
+	if api.logins != 1 || len(store.saved) != 1 {
+		t.Fatalf("expiring session not renewed during a check error (logins=%d saves=%d)", api.logins, len(store.saved))
+	}
+	if !status.Valid || status.Error != "" || status.CheckError != "" {
+		t.Fatalf("unexpected status after renewal: %+v", status)
+	}
+}
+
+func TestExplicitRejectionStillMarksInvalid(t *testing.T) {
+	keeper, _, api, _ := setup(t, time.Hour, true, nil)
+	keeper.CheckAll(context.Background())
+	api.validateErr = errors.New("USER_SESSION_INVALID")
+	keeper.CheckAll(context.Background())
+	if status := keeper.Statuses()[0]; status.Valid || status.Error == "" || status.CheckError != "" {
+		t.Fatalf("explicit rejection must mark invalid: %+v", status)
+	}
+}
+
+func TestIsTransient(t *testing.T) {
+	if IsTransient(errors.New("USER_SESSION_INVALID")) || IsTransient(nil) {
+		t.Fatal("plain error / nil must not be transient")
+	}
+	if !IsTransient(errDNS) || !IsTransient(context.Canceled) || !IsTransient(context.DeadlineExceeded) {
+		t.Fatal("marked errors and context errors must be transient")
+	}
+	if Transient(nil) != nil {
+		t.Fatal("Transient(nil) must be nil")
 	}
 }

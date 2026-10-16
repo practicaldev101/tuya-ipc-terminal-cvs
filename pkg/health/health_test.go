@@ -136,3 +136,25 @@ func TestServeOnLoopback(t *testing.T) {
 		t.Fatalf("unexpected response %d %s", resp.StatusCode, body)
 	}
 }
+
+// A failed validation check is reported as check_error but, with the
+// previous verdict still valid, does not degrade the status.
+func TestCheckErrorIsReportedWithoutDegrading(t *testing.T) {
+	sessions := fakeSessions{{UserKey: "u", Valid: true, CredentialsConfigured: false, CheckError: "dial tcp: lookup example.invalid: no such host"}}
+	doc := Build("v", fakeStreams{running: true}, sessions, time.Now())
+	if doc.Status != "ok" {
+		t.Fatalf("check error alone must not degrade, got %s", doc.Status)
+	}
+	raw, err := json.Marshal(doc.Sessions[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"check_error":"dial tcp: lookup example.invalid: no such host"`) ||
+		!strings.Contains(string(raw), `"credentials_configured":false`) {
+		t.Fatalf("unexpected session doc: %s", raw)
+	}
+	raw, _ = json.Marshal(SessionDoc{UserKey: "u", Valid: true})
+	if strings.Contains(string(raw), "check_error") {
+		t.Fatalf("check_error must be omitted when empty: %s", raw)
+	}
+}
