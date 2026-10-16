@@ -3,3 +3,9 @@ tuya_session_*
 .tuya-*
 .tmp
 tuya-ipc-terminal
+# CVS fork: never commit local state or credentials
+.tuya-data/
+*.env
+.env*
+/credentials*
+dist/

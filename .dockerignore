@@ -1,0 +1,17 @@
+# Never send credentials, sessions or local state to the build context.
+.git
+.github
+.tuya-data
+**/.tuya-data
+.tuya_*
+.tuya-*
+tuya_session_*
+*.env
+.env*
+credentials*
+*.pem
+*.key
+.tmp
+build
+dist
+tuya-ipc-terminal
