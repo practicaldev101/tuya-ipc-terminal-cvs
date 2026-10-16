@@ -45,7 +45,9 @@ func newStartCmd() *cobra.Command {
 		RunE:  runStartServer,
 	}
 
-	cmd.Flags().StringP("address", "a", "127.0.0.1", "RTSP server listening address. Use \"[::]\" to start server on all available addresses.")
+	cmd.Flags().String("listen", rtsp.DefaultListenAddress, "RTSP server listening address (host or IP). Defaults to loopback only; use \"0.0.0.0\" or \"::\" to listen on all interfaces.")
+	cmd.Flags().StringP("address", "a", rtsp.DefaultListenAddress, "Deprecated alias for --listen")
+	_ = cmd.Flags().MarkDeprecated("address", "use --listen instead")
 	cmd.Flags().IntP("port", "p", 8554, "RTSP server port")
 	cmd.Flags().BoolP("daemon", "d", false, "Run as daemon (background)")
 
@@ -84,7 +86,10 @@ func newListEndpointsCmd() *cobra.Command {
 }
 
 func runStartServer(cmd *cobra.Command, args []string) error {
-	address, _ := cmd.Flags().GetString("address")
+	address, _ := cmd.Flags().GetString("listen")
+	if !cmd.Flags().Changed("listen") && cmd.Flags().Changed("address") {
+		address, _ = cmd.Flags().GetString("address")
+	}
 	port, _ := cmd.Flags().GetInt("port")
 	daemon, _ := cmd.Flags().GetBool("daemon")
 
@@ -117,7 +122,7 @@ func runStartServer(cmd *cobra.Command, args []string) error {
 	// Create and start RTSP server
 	rtspServer = rtsp.NewRTSPServer(address, port, storageManager)
 
-	core.Logger.Info().Msgf("Starting RTSP server on port %d...", port)
+	core.Logger.Info().Msgf("Starting RTSP server on %s...", rtsp.ListenAddress(address, port))
 
 	if err := rtspServer.Start(); err != nil {
 		return fmt.Errorf("failed to start RTSP server: %v", err)

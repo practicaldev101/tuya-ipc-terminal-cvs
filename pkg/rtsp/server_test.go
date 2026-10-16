@@ -268,3 +268,23 @@ func TestConcurrentAudioAndVideoForwardingIsRaceSafe(t *testing.T) {
 		t.Fatal("concurrent forwarding did not update client activity")
 	}
 }
+
+func TestListenAddressDefaultsToLoopback(t *testing.T) {
+	tests := map[string]string{
+		"":          "127.0.0.1:8554",
+		"127.0.0.1": "127.0.0.1:8554",
+		"0.0.0.0":   "0.0.0.0:8554",
+		"::":        "[::]:8554",
+		"[::]":      "[::]:8554",
+		"::1":       "[::1]:8554",
+		"localhost": "localhost:8554",
+	}
+	for host, want := range tests {
+		if got := ListenAddress(host, 8554); got != want {
+			t.Errorf("ListenAddress(%q) = %q, want %q", host, got, want)
+		}
+	}
+	if DefaultListenAddress != "127.0.0.1" {
+		t.Fatalf("default listen address must be loopback, got %q", DefaultListenAddress)
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -80,11 +81,27 @@ type ServerConfig struct {
 	EnableAuthentication bool
 }
 
+// DefaultListenAddress keeps the RTSP server on loopback unless the operator
+// explicitly opts into a wider bind address.
+const DefaultListenAddress = "127.0.0.1"
+
+// ListenAddress builds a host:port listen address. The host may be empty
+// (meaning DefaultListenAddress), an IPv4/IPv6 literal (with or without
+// brackets) or a hostname.
+func ListenAddress(host string, port int) string {
+	host = strings.TrimSpace(host)
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	if host == "" {
+		host = DefaultListenAddress
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
 func NewRTSPServer(address string, port int, storageManager *storage.StorageManager) *RTSPServer {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &RTSPServer{
-		address:         address,
+		address:        address,
 		port:           port,
 		storageManager: storageManager,
 		clients:        make(map[string]*RTSPClient),
@@ -103,15 +120,16 @@ func (s *RTSPServer) Start() error {
 		return errors.New("server is already running")
 	}
 
-	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", s.address, s.port))
+	listenAddr := ListenAddress(s.address, s.port)
+	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		return fmt.Errorf("failed to listen on port %d: %v", s.port, err)
+		return fmt.Errorf("failed to listen on %s: %v", listenAddr, err)
 	}
 
 	s.listener = listener
 	s.running = true
 
-	core.Logger.Info().Msgf("RTSP Server started on port %d", s.port)
+	core.Logger.Info().Msgf("RTSP Server started on %s", listenAddr)
 	core.Logger.Info().Msgf("Available endpoints:")
 
 	// List available camera endpoints
@@ -426,7 +444,7 @@ func (s *RTSPServer) printAvailableEndpoints() error {
 		json.Unmarshal([]byte(camera.Skill), &skill)
 
 		supportClarity := skill != nil && (skill.WebRTC&(1<<5)) != 0
-		baseUrl := fmt.Sprintf("rtsp://%s:%d%s", s.address, s.port, camera.RTSPPath)
+		baseUrl := fmt.Sprintf("rtsp://%s%s", ListenAddress(s.address, s.port), camera.RTSPPath)
 
 		if supportClarity {
 			core.Logger.Info().Msgf("  %s/hd (%s)", baseUrl, camera.DeviceName)
