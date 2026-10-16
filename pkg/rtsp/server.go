@@ -28,6 +28,12 @@ type RTSPServer struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 	running        bool
+
+	// mediaTimeout tears a stream down when no video RTP has arrived from
+	// the camera for this long (0 disables the watchdog).
+	mediaTimeout time.Duration
+	// now is the watchdog clock (overridable in tests).
+	now func() time.Time
 }
 
 type RTSPClient struct {
@@ -63,6 +69,14 @@ type CameraStream struct {
 	starting     bool
 	active       bool
 	lastActivity time.Time
+
+	// dead is set once the stream has been stopped or torn down. A dead
+	// stream is never reused or restarted; new clients get a fresh stream
+	// (and therefore a fresh WebRTC session).
+	dead bool
+	// startedAt is when the current WebRTC startup began; the watchdog
+	// measures media silence from max(startedAt, last video packet).
+	startedAt time.Time
 
 	// Delayed shutdown
 	shutdownTimer *time.Timer
@@ -109,7 +123,20 @@ func NewRTSPServer(address string, port int, storageManager *storage.StorageMana
 		ctx:            ctx,
 		cancel:         cancel,
 		running:        false,
+		mediaTimeout:   DefaultMediaTimeout,
+		now:            time.Now,
 	}
+}
+
+// DefaultMediaTimeout is the default media watchdog timeout.
+const DefaultMediaTimeout = 20 * time.Second
+
+// SetMediaTimeout configures the media watchdog. Must be called before
+// Start. A value <= 0 disables the watchdog.
+func (s *RTSPServer) SetMediaTimeout(timeout time.Duration) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.mediaTimeout = timeout
 }
 
 func (s *RTSPServer) Start() error {
@@ -142,6 +169,14 @@ func (s *RTSPServer) Start() error {
 
 	// Start cleanup routine
 	go s.cleanupRoutine()
+
+	// Start media watchdog
+	if s.mediaTimeout > 0 {
+		core.Logger.Info().Msgf("Media watchdog enabled: streams without video for %v are torn down", s.mediaTimeout)
+		go s.watchdogRoutine(s.mediaTimeout)
+	} else {
+		core.Logger.Warn().Msg("Media watchdog disabled")
+	}
 
 	return nil
 }
@@ -277,11 +312,22 @@ func (s *RTSPServer) handleConnection(conn net.Conn) {
 
 	core.Logger.Info().Msgf("New RTSP connection for camera: %s (%s)", camera.DeviceName, camera.DeviceID)
 
-	// Create or get existing stream
-	stream, err := s.getOrCreateStream(camera, streamResolution, user)
-	if err != nil {
-		core.Logger.Error().Err(err).Msgf("Failed to create stream for camera %s", camera.DeviceName)
-		sendRTSPResponse(conn, 500, "Internal Server Error", nil, "Failed to create stream")
+	// Create or get existing stream. A stream can be torn down between
+	// lookup and attach (watchdog / shutdown); retry once with a fresh one.
+	var stream *CameraStream
+	for attempt := 0; attempt < 2 && stream == nil; attempt++ {
+		candidate, err := s.getOrCreateStream(camera, streamResolution, user)
+		if err != nil {
+			core.Logger.Error().Err(err).Msgf("Failed to create stream for camera %s", camera.DeviceName)
+			sendRTSPResponse(conn, 500, "Internal Server Error", nil, "Failed to create stream")
+			return
+		}
+		if !candidate.isDead() {
+			stream = candidate
+		}
+	}
+	if stream == nil {
+		sendRTSPResponse(conn, 503, "Service Unavailable", nil, "")
 		return
 	}
 
@@ -304,7 +350,12 @@ func (s *RTSPServer) handleConnection(conn net.Conn) {
 
 	// Add client to server and stream
 	s.addClient(client)
-	stream.AddClient(client)
+	if err := stream.AddClient(client); err != nil {
+		core.Logger.Warn().Err(err).Msgf("Stream for camera %s closed while attaching client, session=%s", camera.DeviceName, session)
+		sendRTSPResponse(conn, 503, "Service Unavailable", nil, "")
+		s.removeClient(session)
+		return
+	}
 
 	// Handle initial request
 	s.handleRTSPMethod(client, request)
@@ -359,7 +410,7 @@ func (s *RTSPServer) getOrCreateStream(camera *storage.CameraInfo, streamResolut
 	streamId := fmt.Sprintf("%s-%s", camera.DeviceID, streamResolution)
 	if stream, exists := s.streams[streamId]; exists {
 		stream.mutex.Lock()
-		reusable := stream.active || stream.connecting || stream.starting
+		reusable := !stream.dead && (stream.active || stream.connecting || stream.starting)
 		if reusable {
 			stream.lastActivity = time.Now()
 		}
@@ -502,6 +553,7 @@ func NewCameraStream(camera *storage.CameraInfo, resolution string, user *storag
 		clients:       make(map[string]*RTSPClient),
 		active:        false,
 		lastActivity:  time.Now(),
+		startedAt:     time.Now(),
 		shutdownDelay: 5 * time.Second,
 		server:        server,
 		streamId:      fmt.Sprintf("%s-%s", camera.DeviceID, resolution),
@@ -512,9 +564,23 @@ func NewCameraStream(camera *storage.CameraInfo, resolution string, user *storag
 	return stream
 }
 
-func (cs *CameraStream) AddClient(client *RTSPClient) {
+// errStreamClosed is returned when attaching a client to a stream that has
+// already been stopped or torn down.
+var errStreamClosed = errors.New("stream closed")
+
+func (cs *CameraStream) isDead() bool {
+	cs.mutex.RLock()
+	defer cs.mutex.RUnlock()
+	return cs.dead
+}
+
+func (cs *CameraStream) AddClient(client *RTSPClient) error {
 	cs.mutex.Lock()
 	defer cs.mutex.Unlock()
+
+	if cs.dead {
+		return errStreamClosed
+	}
 
 	// Cancel any pending shutdown
 	if cs.shutdownTimer != nil {
@@ -529,8 +595,11 @@ func (cs *CameraStream) AddClient(client *RTSPClient) {
 	// Only one startup should run, and the RTSP client lock must not be held by it.
 	if !cs.active && !cs.starting {
 		cs.starting = true
+		cs.startedAt = time.Now()
 		go cs.startStream()
 	}
+
+	return nil
 }
 
 func (cs *CameraStream) RemoveClient(sessionID string) {
@@ -581,15 +650,20 @@ func (cs *CameraStream) startStreamWith(startBridge func() error) {
 	core.Logger.Info().Msgf("Starting stream for camera: %s", cs.camera.DeviceName)
 
 	if err := startBridge(); err != nil {
-		core.Logger.Error().Err(err).Msg("Failed to start WebRTC bridge")
-		cs.mutex.Lock()
-		cs.starting = false
-		cs.stopStreamInternal()
-		cs.mutex.Unlock()
+		core.Logger.Error().Err(err).Msgf("Failed to start WebRTC bridge for camera: %s", cs.camera.DeviceName)
+		// Disconnect attached RTSP clients too: upstream left them attached
+		// to a stream that would never deliver media, so recorders hung
+		// instead of reconnecting.
+		cs.teardown()
 		return
 	}
 
 	cs.mutex.Lock()
+	if cs.dead {
+		// Torn down (watchdog/shutdown) while starting; teardown owns cleanup.
+		cs.mutex.Unlock()
+		return
+	}
 	cs.starting = false
 	cs.connecting = false
 	cs.active = true
@@ -612,6 +686,7 @@ func (cs *CameraStream) stopStreamInternal() {
 	}
 
 	wasActive := cs.active
+	cs.dead = true
 	cs.starting = false
 	cs.active = false
 	cs.connecting = false

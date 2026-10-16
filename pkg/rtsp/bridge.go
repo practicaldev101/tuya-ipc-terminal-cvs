@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pion "github.com/pion/webrtc/v4"
@@ -46,6 +47,8 @@ type WebRTCBridge struct {
 
 	// State
 	connected bool
+	stopped   atomic.Bool // set once by Stop(); a bridge is single-use
+	closed    bool        // resources released (guarded by mutex)
 	waiter    utils.Waiter
 	mutex     sync.RWMutex
 
@@ -84,12 +87,20 @@ func NewWebRTCBridge(camera *storage.CameraInfo, streamResolution string, user *
 	return wb
 }
 
+// errBridgeStopped is returned by Start when Stop was called before or while
+// the WebRTC session was being negotiated.
+var errBridgeStopped = errors.New("bridge stopped")
+
 func (wb *WebRTCBridge) Start() error {
 	wb.mutex.Lock()
 	defer wb.mutex.Unlock()
 
 	if wb.connected {
 		return errors.New("bridge already connected")
+	}
+
+	if wb.stopped.Load() {
+		return errBridgeStopped
 	}
 
 	core.Logger.Info().Msgf("Starting WebRTC bridge for camera: %s", wb.camera.DeviceName)
@@ -133,6 +144,10 @@ func (wb *WebRTCBridge) Start() error {
 		return fmt.Errorf("failed to get WebRTC config: %v", err)
 	}
 
+	if wb.stopped.Load() {
+		return errBridgeStopped
+	}
+
 	// Parse skill information
 	var skill tuya.Skill
 	if err := json.Unmarshal([]byte(webRTCConfig.Result.Skill), &skill); err != nil {
@@ -163,35 +178,51 @@ func (wb *WebRTCBridge) Start() error {
 		return fmt.Errorf("failed to establish connection: %v", err)
 	}
 
+	if wb.stopped.Load() {
+		return errBridgeStopped
+	}
+
 	wb.connected = true
 	core.Logger.Info().Msgf("WebRTC bridge started successfully for camera: %s", wb.camera.DeviceName)
 
 	return nil
 }
 
+// Stop tears the bridge down. It is idempotent and also releases a bridge
+// whose Start() is still negotiating (or failed half-way): upstream only
+// cleaned up connected bridges, which leaked the MQTT client and peer
+// connection of every failed or stalled startup.
 func (wb *WebRTCBridge) Stop() {
-	wb.mutex.Lock()
-	defer wb.mutex.Unlock()
-
-	if !wb.connected {
+	if !wb.stopped.CompareAndSwap(false, true) {
 		return
 	}
-
-	wb.connected = false
-
-	core.Logger.Info().Msgf("Stopping WebRTC bridge for camera: %s", wb.camera.DeviceName)
 
 	// Cancel context to stop all goroutines
 	wb.cancel()
 
+	// Unblock a Start() that is waiting for the camera so it releases the
+	// mutex; it returns errBridgeStopped.
+	wb.waiter.Done(errBridgeStopped)
+
+	wb.mutex.Lock()
+	defer wb.mutex.Unlock()
+
+	wb.connected = false
+	if wb.closed {
+		return
+	}
+	wb.closed = true
+
+	core.Logger.Info().Msgf("Stopping WebRTC bridge for camera: %s", wb.cameraName())
+
 	// Send disconnect
 	if wb.cameraClient != nil {
-		wb.cameraClient.SendDisconnect()
+		_ = wb.cameraClient.SendDisconnect()
 	}
 
 	// Close peer connection
 	if wb.peerConnection != nil {
-		wb.peerConnection.Close()
+		_ = wb.peerConnection.Close()
 	}
 
 	// Stop MQTT client
@@ -204,7 +235,19 @@ func (wb *WebRTCBridge) Stop() {
 		wb.rtpForwarder.Stop()
 	}
 
-	core.Logger.Info().Msgf("WebRTC bridge stopped for camera: %s", wb.camera.DeviceName)
+	core.Logger.Info().Msgf("WebRTC bridge stopped for camera: %s", wb.cameraName())
+}
+
+// IsStopped reports whether Stop has been called.
+func (wb *WebRTCBridge) IsStopped() bool {
+	return wb.stopped.Load()
+}
+
+func (wb *WebRTCBridge) cameraName() string {
+	if wb.camera == nil {
+		return ""
+	}
+	return wb.camera.DeviceName
 }
 
 func (wb *WebRTCBridge) IsConnected() bool {

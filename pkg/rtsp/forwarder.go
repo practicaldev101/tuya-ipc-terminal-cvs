@@ -34,6 +34,12 @@ type RTPForwarder struct {
 	firstVideoPacket atomic.Bool
 	firstAudioPacket atomic.Bool
 
+	// Wall-clock time (UnixNano) of the last media packet received from the
+	// camera, whether or not any RTSP client is attached. Used by the media
+	// watchdog and the health endpoint.
+	lastVideoAt atomic.Int64
+	lastAudioAt atomic.Int64
+
 	// Cached H.264 parameter sets from the live stream. Clients that join
 	// mid-GOP need these (via sprop-parameter-sets in the SDP) to initialize
 	// their decoder; otherwise they log "non-existing PPS" until the next IDR.
@@ -292,6 +298,7 @@ func (rf *RTPForwarder) ForwardVideoPacket(packet *rtp.Packet) {
 	// Cache SPS/PPS even when nobody is connected yet, so the SDP for the
 	// next client can carry sprop-parameter-sets.
 	rf.cacheParameterSets(packet.Payload)
+	rf.lastVideoAt.Store(time.Now().UnixNano())
 
 	rf.mutex.RLock()
 	defer rf.mutex.RUnlock()
@@ -338,6 +345,8 @@ func (rf *RTPForwarder) ForwardVideoPacket(packet *rtp.Packet) {
 }
 
 func (rf *RTPForwarder) ForwardAudioPacket(packet *rtp.Packet) {
+	rf.lastAudioAt.Store(time.Now().UnixNano())
+
 	rf.mutex.RLock()
 	defer rf.mutex.RUnlock()
 
@@ -387,12 +396,37 @@ func (rf *RTPForwarder) Stop() {
 	rf.firstVideoPacket.Store(true)
 	rf.firstAudioPacket.Store(true)
 
-	// Clear all clients
+	// Clear all clients (snapshot under the lock: RemoveClient locks too)
+	rf.mutex.RLock()
+	sessionIDs := make([]string, 0, len(rf.clients))
 	for sessionID := range rf.clients {
+		sessionIDs = append(sessionIDs, sessionID)
+	}
+	rf.mutex.RUnlock()
+	for _, sessionID := range sessionIDs {
 		rf.RemoveClient(sessionID)
 	}
 
 	core.Logger.Trace().Msg("RTPForwarder stopped and all clients cleared")
+}
+
+// LastVideoAt returns when the last video RTP packet arrived from the camera
+// (zero if none yet).
+func (rf *RTPForwarder) LastVideoAt() time.Time {
+	return unixNanoTime(rf.lastVideoAt.Load())
+}
+
+// LastAudioAt returns when the last audio RTP packet arrived from the camera
+// (zero if none yet).
+func (rf *RTPForwarder) LastAudioAt() time.Time {
+	return unixNanoTime(rf.lastAudioAt.Load())
+}
+
+func unixNanoTime(ns int64) time.Time {
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
 }
 
 func (rf *RTPForwarder) GetClientCount() int {
