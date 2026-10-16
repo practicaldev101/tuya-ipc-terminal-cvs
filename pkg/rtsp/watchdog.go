@@ -13,7 +13,10 @@ import (
 // side stays up: the RTSP TCP connection is healthy, so recorders such as
 // FFmpeg keep waiting forever instead of reconnecting. The watchdog tears a
 // stream down when no video RTP packet has arrived from the camera for
-// mediaTimeout, regardless of attached RTSP clients. Tearing down closes the
+// mediaTimeout, regardless of attached RTSP clients. Until a stream's first
+// video packet the (longer) startupTimeout applies instead, measured from
+// the start of the WebRTC startup, so a slow Tuya API / TURN negotiation is
+// not torn down before it could deliver anything. Tearing down closes the
 // peer connection, the MQTT client and every attached RTSP client
 // connection; the stream is removed from the server map first and marked
 // dead, so a reconnecting client always negotiates a fresh WebRTC session.
@@ -29,7 +32,19 @@ func watchdogInterval(timeout time.Duration) time.Duration {
 	return interval
 }
 
-func (s *RTSPServer) watchdogRoutine(timeout time.Duration) {
+// effectiveStartupTimeout returns the startup grace: startupTimeout, or the
+// media timeout when startupTimeout <= 0 (and 0 when the watchdog is off).
+func effectiveStartupTimeout(mediaTimeout, startupTimeout time.Duration) time.Duration {
+	if mediaTimeout <= 0 {
+		return 0
+	}
+	if startupTimeout <= 0 {
+		return mediaTimeout
+	}
+	return startupTimeout
+}
+
+func (s *RTSPServer) watchdogRoutine(timeout, startupTimeout time.Duration) {
 	ticker := time.NewTicker(watchdogInterval(timeout))
 	defer ticker.Stop()
 
@@ -38,7 +53,7 @@ func (s *RTSPServer) watchdogRoutine(timeout time.Duration) {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
-			for _, stream := range s.checkMediaWatchdog(timeout) {
+			for _, stream := range s.checkMediaWatchdog(timeout, startupTimeout) {
 				// Teardown can block until a pending WebRTC startup step
 				// returns; never let one camera delay the others.
 				go stream.teardown()
@@ -49,11 +64,13 @@ func (s *RTSPServer) watchdogRoutine(timeout time.Duration) {
 
 // checkMediaWatchdog marks every stalled stream dead and removes it from the
 // server map (so no new client can attach to it) and returns those streams.
-// The caller must call teardown() on each returned stream.
-func (s *RTSPServer) checkMediaWatchdog(timeout time.Duration) []*CameraStream {
+// The caller must call teardown() on each returned stream. timeout <= 0
+// disables the check; startupTimeout <= 0 uses timeout for startup too.
+func (s *RTSPServer) checkMediaWatchdog(timeout, startupTimeout time.Duration) []*CameraStream {
 	if timeout <= 0 {
 		return nil
 	}
+	startupTimeout = effectiveStartupTimeout(timeout, startupTimeout)
 
 	now := s.clock()
 
@@ -66,20 +83,26 @@ func (s *RTSPServer) checkMediaWatchdog(timeout time.Duration) []*CameraStream {
 
 	var stalled []*CameraStream
 	for _, stream := range streams {
-		idle, clients, ok := stream.markDeadIfStalled(now, timeout)
+		idle, clients, startup, ok := stream.markDeadIfStalled(now, timeout, startupTimeout)
 		if !ok {
 			continue
 		}
 
-		core.Logger.Warn().
+		event := core.Logger.Warn().
 			Str("component", "watchdog").
 			Str("device", stream.camera.DeviceName).
 			Str("device_id", stream.camera.DeviceID).
 			Str("resolution", stream.resolution).
 			Int("clients", clients).
 			Dur("idle", idle).
-			Msgf("watchdog: stream %s/%s no media for %ds, tearing down",
+			Bool("startup", startup)
+		if startup {
+			event.Msgf("watchdog: stream %s/%s no first video packet %ds after startup, tearing down",
 				stream.camera.DeviceName, stream.resolution, int(idle.Seconds()))
+		} else {
+			event.Msgf("watchdog: stream %s/%s no media for %ds, tearing down",
+				stream.camera.DeviceName, stream.resolution, int(idle.Seconds()))
+		}
 
 		s.removeStream(stream.streamId, stream)
 		stalled = append(stalled, stream)
@@ -104,32 +127,35 @@ func (cs *CameraStream) lastMediaLocked() time.Time {
 	return time.Time{}
 }
 
-// markDeadIfStalled marks a live stream dead when it has not received video
-// for at least timeout (measured from the later of the current startup and
-// the last video packet). It returns the idle time and client count.
-func (cs *CameraStream) markDeadIfStalled(now time.Time, timeout time.Duration) (time.Duration, int, bool) {
+// markDeadIfStalled marks a live stream dead when it is stalled: before its
+// first video packet (of the current startup) when startupTimeout has
+// elapsed since the startup began, afterwards when no video arrived for
+// timeout. It returns the idle time, the client count and whether the
+// stream was still in startup.
+func (cs *CameraStream) markDeadIfStalled(now time.Time, timeout, startupTimeout time.Duration) (time.Duration, int, bool, bool) {
 	cs.mutex.Lock()
 	defer cs.mutex.Unlock()
 
 	if cs.dead || !(cs.active || cs.starting || cs.connecting) {
-		return 0, 0, false
+		return 0, 0, false, false
 	}
 
-	last := cs.startedAt
-	if media := cs.lastMediaLocked(); media.After(last) {
-		last = media
+	last, limit, startup := cs.lastMediaLocked(), timeout, false
+	if last.IsZero() || last.Before(cs.startedAt) {
+		// No video yet: the media timeout has not started counting.
+		last, limit, startup = cs.startedAt, startupTimeout, true
 	}
 	if last.IsZero() {
-		return 0, 0, false
+		return 0, 0, false, false
 	}
 
 	idle := now.Sub(last)
-	if idle < timeout {
-		return 0, 0, false
+	if idle < limit {
+		return 0, 0, false, false
 	}
 
 	cs.dead = true
-	return idle, len(cs.clients), true
+	return idle, len(cs.clients), startup, true
 }
 
 // teardown stops the stream for good: it disconnects and detaches every RTSP

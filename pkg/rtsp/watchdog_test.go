@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -55,7 +56,7 @@ func TestWatchdogKeepsStreamWithRecentMedia(t *testing.T) {
 
 	stream.webrtcBridge.rtpForwarder.lastVideoAt.Store(now.Add(-5 * time.Second).UnixNano())
 
-	if stalled := s.checkMediaWatchdog(20 * time.Second); len(stalled) != 0 {
+	if stalled := s.checkMediaWatchdog(20*time.Second, DefaultStartupTimeout); len(stalled) != 0 {
 		t.Fatalf("watchdog tore down a stream that received media 5s ago")
 	}
 	if stream.isDead() {
@@ -71,7 +72,7 @@ func TestWatchdogTearsDownStalledStreamWithClientsAttached(t *testing.T) {
 
 	stream.webrtcBridge.rtpForwarder.lastVideoAt.Store(now.Add(-21 * time.Second).UnixNano())
 
-	stalled := s.checkMediaWatchdog(20 * time.Second)
+	stalled := s.checkMediaWatchdog(20*time.Second, DefaultStartupTimeout)
 	if len(stalled) != 1 || stalled[0] != stream {
 		t.Fatalf("expected the stalled stream to be returned, got %v", stalled)
 	}
@@ -113,39 +114,121 @@ func TestWatchdogTearsDownStalledStreamWithClientsAttached(t *testing.T) {
 	}
 
 	// Second check must not report the same stream again.
-	if again := s.checkMediaWatchdog(20 * time.Second); len(again) != 0 {
+	if again := s.checkMediaWatchdog(20*time.Second, DefaultStartupTimeout); len(again) != 0 {
 		t.Fatal("dead stream reported twice")
 	}
 }
 
-func TestWatchdogTearsDownStartupThatNeverDeliversMedia(t *testing.T) {
-	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
-	s := newWatchdogTestServer(now)
-	stream, peer := addActiveStream(t, s, now.Add(-30*time.Second))
-	defer peer.Close()
+// watchdogClock is a settable clock for the watchdog.
+type watchdogClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *watchdogClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *watchdogClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
+}
+
+// startingStream registers a stream whose WebRTC startup began at the
+// clock's current time and that has not delivered any video yet.
+func startingStream(t *testing.T, clock *watchdogClock) (*RTSPServer, *CameraStream, net.Conn) {
+	t.Helper()
+	s := newWatchdogTestServer(clock.Now())
+	s.now = clock.Now
+	stream, peer := addActiveStream(t, s, clock.Now())
 	stream.mutex.Lock()
 	stream.active = false
 	stream.starting = true
 	stream.connecting = true
 	stream.mutex.Unlock()
+	return s, stream, peer
+}
 
-	if stalled := s.checkMediaWatchdog(20 * time.Second); len(stalled) != 1 {
-		t.Fatalf("startup without media for 30s not torn down (got %d)", len(stalled))
+// A slow startup (Tuya HTTP calls, MQTT, TURN) is not torn down by the media
+// timeout; the media timeout only starts counting at the first video packet.
+func TestWatchdogStartupGraceThenMediaTimeout(t *testing.T) {
+	clock := &watchdogClock{now: time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)}
+	s, stream, peer := startingStream(t, clock)
+	defer peer.Close()
+	const mediaTimeout, startupTimeout = 20 * time.Second, 60 * time.Second
+
+	clock.Advance(30 * time.Second) // cvs.1 tore the stream down here
+	if stalled := s.checkMediaWatchdog(mediaTimeout, startupTimeout); len(stalled) != 0 {
+		t.Fatal("startup torn down by the media timeout before the first video packet")
+	}
+	clock.Advance(29 * time.Second) // 59 s into startup
+	if stalled := s.checkMediaWatchdog(mediaTimeout, startupTimeout); len(stalled) != 0 {
+		t.Fatal("startup torn down before the startup timeout elapsed")
+	}
+
+	// First video packet at 59 s; the stream becomes active.
+	stream.webrtcBridge.rtpForwarder.lastVideoAt.Store(clock.Now().UnixNano())
+	stream.mutex.Lock()
+	stream.active, stream.starting, stream.connecting = true, false, false
+	stream.mutex.Unlock()
+
+	clock.Advance(19 * time.Second) // 78 s: past the startup timeout, 19 s since media
+	if stalled := s.checkMediaWatchdog(mediaTimeout, startupTimeout); len(stalled) != 0 {
+		t.Fatal("stream with media 19s ago torn down")
+	}
+	clock.Advance(time.Second) // 20 s without media
+	stalled := s.checkMediaWatchdog(mediaTimeout, startupTimeout)
+	if len(stalled) != 1 || stalled[0] != stream {
+		t.Fatalf("stream silent for the media timeout not torn down (got %d)", len(stalled))
+	}
+	stream.teardown()
+}
+
+func TestWatchdogStartupTimeoutTearsDownStartupWithoutMedia(t *testing.T) {
+	clock := &watchdogClock{now: time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)}
+	s, stream, peer := startingStream(t, clock)
+	defer peer.Close()
+
+	clock.Advance(60 * time.Second)
+	stalled := s.checkMediaWatchdog(20*time.Second, 60*time.Second)
+	if len(stalled) != 1 || stalled[0] != stream {
+		t.Fatalf("startup without media for the startup timeout not torn down (got %d)", len(stalled))
+	}
+	if !stream.isDead() {
+		t.Fatal("stream not marked dead")
+	}
+	stream.teardown()
+}
+
+// Startup timeout 0 falls back to the media timeout (cvs.1 behaviour).
+func TestWatchdogZeroStartupTimeoutUsesMediaTimeout(t *testing.T) {
+	clock := &watchdogClock{now: time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)}
+	s, _, peer := startingStream(t, clock)
+	defer peer.Close()
+
+	clock.Advance(10 * time.Second)
+	if stalled := s.checkMediaWatchdog(20*time.Second, 0); len(stalled) != 0 {
+		t.Fatal("startup torn down before the timeout elapsed")
+	}
+	clock.Advance(20 * time.Second)
+	if stalled := s.checkMediaWatchdog(20*time.Second, 0); len(stalled) != 1 {
+		t.Fatalf("startup without media for 30s not torn down with startup timeout 0 (got %d)", len(stalled))
 	}
 }
 
-func TestWatchdogGivesNewStartupGracePeriod(t *testing.T) {
-	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
-	s := newWatchdogTestServer(now)
-	stream, peer := addActiveStream(t, s, now.Add(-10*time.Second))
-	defer peer.Close()
-	stream.mutex.Lock()
-	stream.active = false
-	stream.starting = true
-	stream.mutex.Unlock()
-
-	if stalled := s.checkMediaWatchdog(20 * time.Second); len(stalled) != 0 {
-		t.Fatal("startup torn down before the timeout elapsed")
+func TestEffectiveStartupTimeout(t *testing.T) {
+	cases := []struct{ media, startup, want time.Duration }{
+		{20 * time.Second, 60 * time.Second, 60 * time.Second},
+		{20 * time.Second, 0, 20 * time.Second},
+		{0, 60 * time.Second, 0},
+	}
+	for _, c := range cases {
+		if got := effectiveStartupTimeout(c.media, c.startup); got != c.want {
+			t.Errorf("effectiveStartupTimeout(%v, %v) = %v, want %v", c.media, c.startup, got, c.want)
+		}
 	}
 }
 
@@ -155,7 +238,7 @@ func TestWatchdogDisabledWithZeroTimeout(t *testing.T) {
 	_, peer := addActiveStream(t, s, now.Add(-time.Hour))
 	defer peer.Close()
 
-	if stalled := s.checkMediaWatchdog(0); len(stalled) != 0 {
+	if stalled := s.checkMediaWatchdog(0, DefaultStartupTimeout); len(stalled) != 0 {
 		t.Fatal("watchdog acted while disabled")
 	}
 }

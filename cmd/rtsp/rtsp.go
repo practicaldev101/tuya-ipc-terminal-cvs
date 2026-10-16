@@ -55,6 +55,7 @@ func newStartCmd() *cobra.Command {
 	_ = cmd.Flags().MarkDeprecated("address", "use --listen instead")
 	cmd.Flags().IntP("port", "p", 8554, "RTSP server port")
 	cmd.Flags().Duration("media-timeout", rtsp.DefaultMediaTimeout, "Tear a stream down (even with RTSP clients attached) when no video RTP arrived for this long; 0 disables [env TUYA_MEDIA_TIMEOUT]")
+	cmd.Flags().Duration("startup-timeout", rtsp.DefaultStartupTimeout, "Time a new stream gets to deliver its first video packet before it is torn down; --media-timeout only applies after that first packet. 0 uses --media-timeout [env TUYA_STARTUP_TIMEOUT]")
 	cmd.Flags().BoolP("daemon", "d", false, "Run as daemon (background)")
 
 	// Session keeper (automatic re-login)
@@ -107,6 +108,10 @@ func runStartServer(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	startupTimeout, err := durationFlagOrEnv(cmd, "startup-timeout", "TUYA_STARTUP_TIMEOUT")
+	if err != nil {
+		return err
+	}
 	sessionCfg, err := sessionConfigFromFlags(cmd)
 	if err != nil {
 		return err
@@ -144,6 +149,7 @@ func runStartServer(cmd *cobra.Command, args []string) error {
 	// Create and start RTSP server
 	rtspServer = rtsp.NewRTSPServer(address, port, storageManager)
 	rtspServer.SetMediaTimeout(mediaTimeout)
+	rtspServer.SetStartupTimeout(startupTimeout)
 
 	core.Logger.Info().Msgf("Starting RTSP server on %s...", rtsp.ListenAddress(address, port))
 

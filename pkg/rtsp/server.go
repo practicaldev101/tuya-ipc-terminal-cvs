@@ -32,6 +32,11 @@ type RTSPServer struct {
 	// mediaTimeout tears a stream down when no video RTP has arrived from
 	// the camera for this long (0 disables the watchdog).
 	mediaTimeout time.Duration
+	// startupTimeout applies instead of mediaTimeout until a stream's
+	// first video packet: WebRTC startup (several Tuya HTTP calls, MQTT,
+	// ICE/TURN) can legitimately take longer than the media timeout.
+	// <= 0 uses mediaTimeout.
+	startupTimeout time.Duration
 	// now is the watchdog clock (overridable in tests).
 	now func() time.Time
 }
@@ -74,8 +79,9 @@ type CameraStream struct {
 	// stream is never reused or restarted; new clients get a fresh stream
 	// (and therefore a fresh WebRTC session).
 	dead bool
-	// startedAt is when the current WebRTC startup began; the watchdog
-	// measures media silence from max(startedAt, last video packet).
+	// startedAt is when the current WebRTC startup began. Until the first
+	// video packet the watchdog measures the startup timeout from it;
+	// afterwards the media timeout from the last video packet.
 	startedAt time.Time
 
 	// Delayed shutdown
@@ -124,12 +130,26 @@ func NewRTSPServer(address string, port int, storageManager *storage.StorageMana
 		cancel:         cancel,
 		running:        false,
 		mediaTimeout:   DefaultMediaTimeout,
+		startupTimeout: DefaultStartupTimeout,
 		now:            time.Now,
 	}
 }
 
 // DefaultMediaTimeout is the default media watchdog timeout.
 const DefaultMediaTimeout = 20 * time.Second
+
+// DefaultStartupTimeout is the default time a new stream gets to deliver its
+// first video packet before the watchdog tears it down.
+const DefaultStartupTimeout = 60 * time.Second
+
+// SetStartupTimeout configures the watchdog's startup grace (time allowed
+// until the first video packet). Must be called before Start. A value <= 0
+// applies the media timeout to startup too.
+func (s *RTSPServer) SetStartupTimeout(timeout time.Duration) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.startupTimeout = timeout
+}
 
 // SetMediaTimeout configures the media watchdog. Must be called before
 // Start. A value <= 0 disables the watchdog.
@@ -172,8 +192,10 @@ func (s *RTSPServer) Start() error {
 
 	// Start media watchdog
 	if s.mediaTimeout > 0 {
-		core.Logger.Info().Msgf("Media watchdog enabled: streams without video for %v are torn down", s.mediaTimeout)
-		go s.watchdogRoutine(s.mediaTimeout)
+		startupTimeout := effectiveStartupTimeout(s.mediaTimeout, s.startupTimeout)
+		core.Logger.Info().Msgf("Media watchdog enabled: streams without video for %v are torn down (first video packet expected within %v of startup)",
+			s.mediaTimeout, startupTimeout)
+		go s.watchdogRoutine(s.mediaTimeout, startupTimeout)
 	} else {
 		core.Logger.Warn().Msg("Media watchdog disabled")
 	}
