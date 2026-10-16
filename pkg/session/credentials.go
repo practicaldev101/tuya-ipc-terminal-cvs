@@ -2,6 +2,7 @@ package session
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -24,6 +25,11 @@ const (
 	EnvRegion          = "TUYA_REGION"
 	EnvCredentialsFile = "TUYA_CREDENTIALS_FILE"
 )
+
+// ErrIncompleteCredentials is returned (wrapped) by LoadCredentials when only
+// one of TUYA_EMAIL / TUYA_PASSWORD is set. Callers should treat it as "no
+// automatic re-login", not as a fatal configuration error.
+var ErrIncompleteCredentials = errors.New("incomplete credentials")
 
 // LoadCredentials returns the configured re-login credentials, or nil when
 // none are configured. Values come from the environment (TUYA_EMAIL,
@@ -64,7 +70,7 @@ func LoadCredentials(path string, getenv func(string) string) (*Credentials, err
 		return nil, nil
 	}
 	if creds.Email == "" || creds.Password == "" {
-		return nil, fmt.Errorf("incomplete credentials: both %s and %s are required", EnvEmail, EnvPassword)
+		return nil, fmt.Errorf("%w: both %s and %s are required", ErrIncompleteCredentials, EnvEmail, EnvPassword)
 	}
 
 	return creds, nil

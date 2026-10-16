@@ -309,7 +309,16 @@ func sessionConfigFromFlags(cmd *cobra.Command) (*session.Config, error) {
 	credentialsFile := stringFlagOrEnv(cmd, "credentials-file", session.EnvCredentialsFile)
 	credentials, err := session.LoadCredentials(credentialsFile, os.Getenv)
 	if err != nil {
-		return nil, fmt.Errorf("session keeper: %v", err)
+		// Re-login is optional: refusing to start would put the bridge in a
+		// restart loop that records nothing. Run the keeper report-only
+		// (it still validates sessions and reports them in /healthz with
+		// credentials_configured: false).
+		msg := "session: credentials unreadable, automatic re-login disabled"
+		if errors.Is(err, session.ErrIncompleteCredentials) {
+			msg = "session: credentials incomplete, automatic re-login disabled"
+		}
+		core.Logger.Error().Err(err).Str("component", "session").Msg(msg)
+		credentials = nil
 	}
 
 	return &session.Config{

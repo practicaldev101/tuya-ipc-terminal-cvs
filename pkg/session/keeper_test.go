@@ -288,8 +288,8 @@ func TestLoadCredentials(t *testing.T) {
 			return "only@example.com"
 		}
 		return ""
-	}); err == nil {
-		t.Fatal("email without password must be an error")
+	}); !errors.Is(err, ErrIncompleteCredentials) {
+		t.Fatalf("email without password must be ErrIncompleteCredentials, got %v", err)
 	}
 
 	if _, err := LoadCredentials(filepath.Join(t.TempDir(), "missing"), getenv); err == nil {
