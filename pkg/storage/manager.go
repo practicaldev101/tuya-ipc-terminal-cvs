@@ -54,6 +54,14 @@ func NewStorageManager() (*StorageManager, error) {
 	}, nil
 }
 
+// NewStorageManagerAt uses dataDir instead of ./.tuya-data.
+func NewStorageManagerAt(dataDir string) (*StorageManager, error) {
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		return nil, err
+	}
+	return &StorageManager{dataDir: dataDir}, nil
+}
+
 func (sm *StorageManager) GetDataDir() string {
 	return sm.dataDir
 }
@@ -131,7 +139,36 @@ func (sm *StorageManager) SaveUser(region, email string, sessionData *tuya.Sessi
 	}
 
 	filePath := sm.getUserFilePath(region, email)
-	return os.WriteFile(filePath, data, 0600)
+	return writeFileAtomic(filePath, data, 0600)
+}
+
+// writeFileAtomic replaces path via a temp file + rename so concurrent
+// readers (the RTSP server re-reads user sessions for every new stream while
+// the session keeper may be renewing them) never see a truncated file.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 func (sm *StorageManager) RemoveUser(region, email string) error {

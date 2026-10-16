@@ -1,6 +1,7 @@
 package rtsp
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -10,9 +11,12 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"tuya-ipc-terminal/cmd/auth"
 	"tuya-ipc-terminal/pkg/core"
 	"tuya-ipc-terminal/pkg/rtsp"
+	"tuya-ipc-terminal/pkg/session"
 	"tuya-ipc-terminal/pkg/storage"
+	"tuya-ipc-terminal/pkg/tuya"
 )
 
 var storageManager *storage.StorageManager
@@ -51,6 +55,12 @@ func newStartCmd() *cobra.Command {
 	cmd.Flags().IntP("port", "p", 8554, "RTSP server port")
 	cmd.Flags().Duration("media-timeout", rtsp.DefaultMediaTimeout, "Tear a stream down (even with RTSP clients attached) when no video RTP arrived for this long; 0 disables [env TUYA_MEDIA_TIMEOUT]")
 	cmd.Flags().BoolP("daemon", "d", false, "Run as daemon (background)")
+
+	// Session keeper (automatic re-login)
+	cmd.Flags().Duration("session-check-interval", session.DefaultCheckInterval, "How often stored Tuya sessions are validated and renewed; 0 disables the session keeper [env TUYA_SESSION_CHECK_INTERVAL]")
+	cmd.Flags().Duration("session-renew-margin", session.DefaultRenewMargin, "Re-login this long before the session's expected expiry [env TUYA_SESSION_RENEW_MARGIN]")
+	cmd.Flags().Duration("session-lifetime", session.DefaultSessionLifetime, "Assumed session lifetime after login when cookies carry no expiry [env TUYA_SESSION_LIFETIME]")
+	cmd.Flags().String("credentials-file", "", "File with TUYA_EMAIL=, TUYA_PASSWORD= and optional TUYA_REGION= lines for non-interactive re-login (overrides those env vars) [env TUYA_CREDENTIALS_FILE]")
 
 	return cmd
 }
@@ -95,6 +105,10 @@ func runStartServer(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	sessionCfg, err := sessionConfigFromFlags(cmd)
+	if err != nil {
+		return err
+	}
 	port, _ := cmd.Flags().GetInt("port")
 	daemon, _ := cmd.Flags().GetBool("daemon")
 
@@ -132,6 +146,17 @@ func runStartServer(cmd *cobra.Command, args []string) error {
 
 	if err := rtspServer.Start(); err != nil {
 		return fmt.Errorf("failed to start RTSP server: %v", err)
+	}
+
+	keeperCtx, stopKeeper := context.WithCancel(context.Background())
+	defer stopKeeper()
+	if sessionCfg != nil {
+		keeper := session.NewKeeper(*sessionCfg, storageManager, session.TuyaValidate, session.TuyaPasswordLogin(lookupRegion))
+		core.Logger.Info().Msgf("Session keeper enabled: check every %v, renew %v before expiry, credentials configured: %v",
+			sessionCfg.CheckInterval, sessionCfg.RenewMargin, sessionCfg.Credentials != nil)
+		go keeper.Run(keeperCtx)
+	} else {
+		core.Logger.Warn().Msg("Session keeper disabled: stored sessions will not be validated or renewed")
 	}
 
 	if daemon {
@@ -246,4 +271,45 @@ func runListEndpoints(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  vlc rtsp://localhost:%d%s\n", port, cameras[0].RTSPPath)
 
 	return nil
+}
+
+// sessionConfigFromFlags returns nil when the session keeper is disabled.
+func sessionConfigFromFlags(cmd *cobra.Command) (*session.Config, error) {
+	interval, err := durationFlagOrEnv(cmd, "session-check-interval", "TUYA_SESSION_CHECK_INTERVAL")
+	if err != nil {
+		return nil, err
+	}
+	if interval <= 0 {
+		return nil, nil
+	}
+	margin, err := durationFlagOrEnv(cmd, "session-renew-margin", "TUYA_SESSION_RENEW_MARGIN")
+	if err != nil {
+		return nil, err
+	}
+	lifetime, err := durationFlagOrEnv(cmd, "session-lifetime", "TUYA_SESSION_LIFETIME")
+	if err != nil {
+		return nil, err
+	}
+
+	credentialsFile := stringFlagOrEnv(cmd, "credentials-file", session.EnvCredentialsFile)
+	credentials, err := session.LoadCredentials(credentialsFile, os.Getenv)
+	if err != nil {
+		return nil, fmt.Errorf("session keeper: %v", err)
+	}
+
+	return &session.Config{
+		CheckInterval:   interval,
+		RenewMargin:     margin,
+		SessionLifetime: lifetime,
+		Credentials:     credentials,
+	}, nil
+}
+
+func lookupRegion(name string) (tuya.Region, bool) {
+	for _, region := range auth.AvailableRegions {
+		if region.Name == name {
+			return region, true
+		}
+	}
+	return tuya.Region{}, false
 }
