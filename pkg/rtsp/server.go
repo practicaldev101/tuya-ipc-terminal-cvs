@@ -276,22 +276,20 @@ type ServerStats struct {
 }
 
 func (s *RTSPServer) acceptConnections() {
-	for s.running {
-		select {
-		case <-s.ctx.Done():
-			return
-		default:
-			conn, err := s.listener.Accept()
-			if err != nil {
-				if s.running {
-					core.Logger.Error().Err(err).Msg("Error accepting connection")
-				}
-				continue
+	// s.ctx (not s.running, which Stop writes under the mutex) signals
+	// shutdown; reading s.running here was a data race.
+	for {
+		conn, err := s.listener.Accept()
+		if err != nil {
+			if s.ctx.Err() != nil {
+				return
 			}
-
-			// Handle connection in goroutine
-			go s.handleConnection(conn)
+			core.Logger.Error().Err(err).Msg("Error accepting connection")
+			continue
 		}
+
+		// Handle connection in goroutine
+		go s.handleConnection(conn)
 	}
 }
 
