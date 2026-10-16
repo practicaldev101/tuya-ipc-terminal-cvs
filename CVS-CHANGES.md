@@ -4,7 +4,7 @@ This is a pinned, patched fork of [seydx/tuya-ipc-terminal](https://github.com/s
 (MIT) maintained for the Cloud Video Surveillance & Evidence Retention project.
 It bridges Tuya WebRTC cameras (initially a CORN CHM-302) to a local RTSP
 endpoint that FFmpeg records from. Branch: `cvs`. Releases: `v0.0.6-cvs.1`,
-`v0.0.6-cvs.2` (current; see [Changes in v0.0.6-cvs.2](#changes-in-v006-cvs2)).
+`v0.0.6-cvs.3` (current; see [Changes in v0.0.6-cvs.3](#changes-in-v006-cvs3)).
 
 Nothing in this repository is environment-specific: no credentials, cookies,
 IP addresses or `.tuya-data` files. Session state is created at runtime in
@@ -48,6 +48,13 @@ Nothing was skipped: none of the picks turned out redundant with PR #33.
 | `8b1cc52` | Pinned multi-stage `Dockerfile`, `.dockerignore`, `VERSION` = `0.0.6-cvs.1` (now a `var` so `-X main.VERSION=` works). |
 | `6442f3e` | CI (`ci.yml`: gofmt, build, vet, `test -race`, amd64+arm64 docker build) and release (`release.yml`: on `v*` tags push `ghcr.io/practicaldev101/tuya-ipc-terminal-cvs:<version>` and print the digest). Actions pinned by SHA. |
 
+## Changes in v0.0.6-cvs.3
+
+| Commit | Change |
+|---|---|
+| (sd clarity) | **Never send a video clarity for `/sd`** (partially reverts `566b921` / dobriys `5482cc6`; HD clarity from `5691880` unchanged). On the CORN CHM-302 (clarities `[2 4]`) clarity 2 made the camera put **HEVC** NAL units on the negotiated **H.264** WebRTC track while the SDP still advertised H.264, so nothing downstream could decode it (Frigate: `data partitioning is not implemented`; RTP inner NAL types 0/2/4/6 = HEVC VPS/SPS/PPS/IDR headers read as H.264). Without the clarity message `/sd` carries real H.264 Main 640x720 @ 15 fps with in-band SPS/PPS identical to `sprop-parameter-sets`. Verified against the target camera on 2026-10-16. No unit test: the condition sits inside the WebRTC peer setup and needs a live camera. |
+| (release) | `VERSION` = `0.0.6-cvs.3`. |
+
 ## Changes in v0.0.6-cvs.2
 
 Review fixes on top of `v0.0.6-cvs.1` (`1e82410`).
@@ -88,7 +95,7 @@ Local (Go 1.26.4; `go.mod` requires >= 1.24):
 
 ```bash
 CGO_ENABLED=0 go build -trimpath -buildvcs=false \
-  -ldflags "-s -w -X main.VERSION=0.0.6-cvs.2" -o tuya-ipc-terminal .
+  -ldflags "-s -w -X main.VERSION=0.0.6-cvs.3" -o tuya-ipc-terminal .
 go vet ./... && go test -race ./...
 ```
 
@@ -100,7 +107,7 @@ Docker (base images pinned by digest in the `Dockerfile`):
 | runtime | `gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab` |
 
 ```bash
-docker build -t tuya-ipc-terminal-cvs:0.0.6-cvs.2 .
+docker build -t tuya-ipc-terminal-cvs:0.0.6-cvs.3 .
 ```
 
 The runtime image runs as uid/gid 65532, working directory and volume `/data`
@@ -136,13 +143,13 @@ docker run -d --name tuya-bridge --network host \
   -v tuya-data:/data \
   -v /etc/tuya-bridge/credentials.env:/run/secrets/tuya.env:ro \
   -e TUYA_CREDENTIALS_FILE=/run/secrets/tuya.env \
-  tuya-ipc-terminal-cvs:0.0.6-cvs.2 \
+  tuya-ipc-terminal-cvs:0.0.6-cvs.3 \
   rtsp start --listen 127.0.0.1 --port 8554 --health-listen 8556
 ```
 
 The first `auth add` / `cameras refresh` can be run with the same image and
 volume (`docker run --rm -it --network host -v tuya-data:/data
-tuya-ipc-terminal-cvs:0.0.6-cvs.2 auth add ...`).
+tuya-ipc-terminal-cvs:0.0.6-cvs.3 auth add ...`).
 
 ## Known limitations
 
