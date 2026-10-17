@@ -15,7 +15,7 @@ COPY go.mod go.sum ./
 RUN go mod download && go mod verify
 
 COPY . .
-ARG VERSION=0.0.6-cvs.4
+ARG VERSION=0.0.6-cvs.5
 ARG TARGETOS
 ARG TARGETARCH
 RUN GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
