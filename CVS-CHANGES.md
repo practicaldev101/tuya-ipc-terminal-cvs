@@ -4,7 +4,7 @@ This is a pinned, patched fork of [seydx/tuya-ipc-terminal](https://github.com/s
 (MIT) maintained for the Cloud Video Surveillance & Evidence Retention project.
 It bridges Tuya WebRTC cameras (initially a CORN CHM-302) to a local RTSP
 endpoint that FFmpeg records from. Branch: `cvs`. Releases: `v0.0.6-cvs.1`, `v0.0.6-cvs.3`,
-`v0.0.6-cvs.4`, `v0.0.6-cvs.5` (current; see [Changes in v0.0.6-cvs.5](#changes-in-v006-cvs5)).
+`v0.0.6-cvs.4`, `v0.0.6-cvs.5`, `v0.0.6-cvs.6` (current; see [Changes in v0.0.6-cvs.6](#changes-in-v006-cvs6)).
 
 Nothing in this repository is environment-specific: no credentials, cookies,
 IP addresses or `.tuya-data` files. Session state is created at runtime in
@@ -47,6 +47,19 @@ Nothing was skipped: none of the picks turned out redundant with PR #33.
 | `51dbb80` | Session log times as RFC3339. |
 | `8b1cc52` | Pinned multi-stage `Dockerfile`, `.dockerignore`, `VERSION` = `0.0.6-cvs.1` (now a `var` so `-X main.VERSION=` works). |
 | `6442f3e` | CI (`ci.yml`: gofmt, build, vet, `test -race`, amd64+arm64 docker build) and release (`release.yml`: on `v*` tags push `ghcr.io/practicaldev101/tuya-ipc-terminal-cvs:<version>` and print the digest). Actions pinned by SHA. |
+
+## Changes in v0.0.6-cvs.6
+
+v0.0.6-cvs.5 reordered video RTP but skipped a hole after 8 packets. On the
+same capture, 349 packets arrived more than 8 sequence numbers late (max 44,
+none later than 64). Those were dropped and the slice still failed. The
+30-minute gate on cvs.5 fell from 76% bad segments to 44%, and the median
+frame rate rose to 15.2 fps.
+
+| Commit | Change |
+|---|---|
+| (this release) | Reorder depth 8 → 64. |
+| (release) | `VERSION` = `0.0.6-cvs.6`. |
 
 ## Changes in v0.0.6-cvs.5
 

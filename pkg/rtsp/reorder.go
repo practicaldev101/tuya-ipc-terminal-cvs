@@ -3,12 +3,13 @@ package rtsp
 import "github.com/pion/rtp"
 
 // videoReorderDepth is how many video RTP packets may sit ahead of a hole
-// before the hole is skipped. The CORN stream inverts adjacent packets
-// (N+1 arrives before N) inside FU-A fragments. TCP clients assemble those
-// fragments in arrival order, so the inversion becomes a corrupt slice.
-// A depth of a few packets reorders those swaps and still moves on when a
+// before the hole is skipped. On the CORN capture of 2026-10-17, packets
+// arrived up to 44 sequence numbers late (p99 40, none later than 64) and
+// TCP clients assemble FU-A in arrival order, so the late fragment corrupts
+// the slice. Depth 8 released that hole too early and the late packet was
+// then dropped. 64 covers the observed lateness and still moves on when a
 // packet is actually missing, instead of stalling the read loop.
-const videoReorderDepth = 8
+const videoReorderDepth = 64
 
 // videoReorder releases video RTP packets in sequence-number order.
 type videoReorder struct {
