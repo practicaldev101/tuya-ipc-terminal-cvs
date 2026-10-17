@@ -59,6 +59,12 @@ type RTPForwarder struct {
 	ppsNAL     []byte
 	paramMutex sync.RWMutex
 
+	// videoOrder reorders video RTP before it is written to clients.
+	// reorderMu guards it. It is not the client mutex: a TCP write can
+	// block, and the WebRTC read loop must not wait on that.
+	reorderMu  sync.Mutex
+	videoOrder videoReorder
+
 	OnBackchannelAudio func(*rtp.Packet)
 }
 
@@ -321,24 +327,41 @@ func (rf *RTPForwarder) ForwardVideoPacket(packet *rtp.Packet) {
 	rf.lastVideoAt.Store(time.Now().UnixNano())
 
 	rf.mutex.RLock()
-	defer rf.mutex.RUnlock()
-
-	if len(rf.clients) == 0 {
+	clients := len(rf.clients)
+	rf.mutex.RUnlock()
+	if clients == 0 {
+		rf.reorderMu.Lock()
+		rf.videoOrder.reset()
+		rf.reorderMu.Unlock()
 		return
 	}
 
-	// The RTSP SDP advertises video as payload type 96 for both H.264 and H.265.
-	// Tuya's HEVC data channel uses PT 95, which RTSP clients discard as unknown.
-	forwardedPacket := *packet
-	forwardedPacket.PayloadType = 96
+	// Own the packet. pion reuses the ReadRTP buffer, and this packet may
+	// sit in the reorder buffer until its predecessor arrives.
+	// Payload type 96 matches the RTSP SDP for both H.264 and H.265.
+	// Tuya's HEVC data channel uses PT 95, which RTSP clients discard.
+	cp := packet.Clone()
+	cp.PayloadType = 96
 
-	data, err := forwardedPacket.Marshal()
+	rf.reorderMu.Lock()
+	ready := rf.videoOrder.push(cp)
+	rf.reorderMu.Unlock()
+
+	for _, p := range ready {
+		rf.writeVideoPacket(p)
+	}
+}
+
+func (rf *RTPForwarder) writeVideoPacket(packet *rtp.Packet) {
+	data, err := packet.Marshal()
 	if err != nil {
 		core.Logger.Error().Err(err).Msg("Error marshaling video RTP packet")
 		return
 	}
 
-	// Forward to all clients
+	rf.mutex.RLock()
+	defer rf.mutex.RUnlock()
+
 	for sessionID, client := range rf.clients {
 		client.lastActivity.Store(time.Now().UnixNano())
 
@@ -404,6 +427,10 @@ func (rf *RTPForwarder) ForwardAudioPacket(packet *rtp.Packet) {
 }
 
 func (rf *RTPForwarder) Stop() {
+	rf.reorderMu.Lock()
+	rf.videoOrder.reset()
+	rf.reorderMu.Unlock()
+
 	// Reset SSRCs
 	rf.videoSSRC.Store(0)
 	rf.audioSSRC.Store(1)

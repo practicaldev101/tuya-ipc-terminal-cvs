@@ -10,7 +10,7 @@ import (
 
 // VERSION is a var (not a const) so release builds can stamp it with
 // -ldflags "-X main.VERSION=...".
-var VERSION = "0.0.6-cvs.4"
+var VERSION = "0.0.6-cvs.6"
 
 func main() {
 	core.InitLogger()
