@@ -104,6 +104,11 @@ func (s *RTSPServer) checkMediaWatchdog(timeout, startupTimeout time.Duration) [
 				stream.camera.DeviceName, stream.resolution, int(idle.Seconds()))
 		}
 
+		// The camera keeps the old WebRTC slot for about 10s after this
+		// teardown's disconnect. Arm the quiet period before the stream
+		// leaves the map, so the reconnect that the closed RTSP socket
+		// provokes cannot send a new offer in the same second.
+		s.armQuietAfterDisconnect(stream)
 		s.removeStream(stream.streamId, stream)
 		stalled = append(stalled, stream)
 	}

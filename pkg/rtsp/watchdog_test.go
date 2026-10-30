@@ -86,8 +86,14 @@ func TestWatchdogTearsDownStalledStreamWithClientsAttached(t *testing.T) {
 		t.Fatal("stalled stream still in server map; reconnecting clients would reuse it")
 	}
 
-	// A reconnecting client must get a brand-new stream, not the dead one,
-	// even before teardown has finished.
+	// The camera still holds the previous WebRTC slot. A reconnect in that
+	// quiet period must be refused, even before teardown has finished.
+	if _, err := s.getOrCreateStream(stream.camera, "sd", nil); !errors.As(err, new(*errStartBackoff)) {
+		t.Fatalf("reconnect during the quiet period = %v, want backoff", err)
+	}
+	s.now = func() time.Time { return now.Add(MinStartBackoff) }
+
+	// After the quiet period the client must get a brand-new stream, not the dead one.
 	fresh, err := s.getOrCreateStream(stream.camera, "sd", nil)
 	if err != nil {
 		t.Fatal(err)

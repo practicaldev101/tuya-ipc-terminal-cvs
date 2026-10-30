@@ -68,7 +68,7 @@ func (f *fakeStarter) start(*CameraStream) error {
 }
 
 func TestStartBackoffDelaySequence(t *testing.T) {
-	want := []time.Duration{0, 1, 2, 4, 8, 16, 30, 30, 30}
+	want := []time.Duration{0, 12, 24, 30, 30, 30, 30, 30, 30}
 	for failures, seconds := range want {
 		if got := startBackoffDelay(failures); got != seconds*time.Second {
 			t.Errorf("startBackoffDelay(%d) = %v, want %ds", failures, got, seconds)
@@ -131,8 +131,8 @@ func TestStartBackoffRefusesAttemptsWithoutStarting(t *testing.T) {
 		return err
 	}
 
-	// Failure k opens a window of 1, 2, 4, 8, 16, 30, 30 s.
-	for k, window := range []time.Duration{1, 2, 4, 8, 16, 30, 30} {
+	// Failure k opens a window of 12, 24, then the 30 s cap.
+	for k, window := range []time.Duration{12, 24, 30, 30, 30, 30, 30} {
 		window *= time.Second
 		if err := try(); err != nil {
 			t.Fatalf("failure %d: attempt after the window was refused: %v", k+1, err)
@@ -172,19 +172,19 @@ func TestStartBackoffRefusesAttemptsWithoutStarting(t *testing.T) {
 	}
 	stream.teardown()
 
-	// The next failure starts again at 1 s.
+	// The next failure starts again at MinStartBackoff.
 	starter.set(errors.New("failed to establish connection: timeout"))
 	if err := try(); err != nil {
 		t.Fatal(err)
 	}
-	clock.Advance(time.Second - time.Millisecond)
+	clock.Advance(MinStartBackoff - time.Millisecond)
 	if err := try(); err == nil {
-		t.Fatal("first window after reset must be 1 s")
+		t.Fatal("first window after reset must be MinStartBackoff")
 	}
 	clock.Advance(time.Millisecond)
 	before := starter.calls.Load()
 	if err := try(); err != nil || starter.calls.Load() != before+1 {
-		t.Fatalf("attempt after the 1 s window must start: %v", err)
+		t.Fatalf("attempt after the quiet window must start: %v", err)
 	}
 }
 
@@ -217,7 +217,7 @@ func TestStartFailureHealthAndSessionHook(t *testing.T) {
 	if h.State != "stopped" || h.Device != "CORN CHM-302" || h.Resolution != "sd" {
 		t.Fatalf("unexpected health %+v", h)
 	}
-	if !h.NextStartAttemptAt.Equal(clock.Now().Add(time.Second)) {
+	if !h.NextStartAttemptAt.Equal(clock.Now().Add(MinStartBackoff)) {
 		t.Fatalf("next_start_attempt_at = %v", h.NextStartAttemptAt)
 	}
 	if strings.Contains(h.LastStartError, "secret") || !strings.Contains(h.LastStartError, "wss://<redacted>@m1") {
@@ -227,7 +227,7 @@ func TestStartFailureHealthAndSessionHook(t *testing.T) {
 		t.Fatalf("last_start_error not bounded: %d bytes", len(h.LastStartError))
 	}
 
-	clock.Advance(time.Second)
+	clock.Advance(MinStartBackoff)
 	if h := s.StreamsHealth()[0]; !h.NextStartAttemptAt.IsZero() || h.LastStartError == "" {
 		t.Fatalf("after the window: next attempt must be null, error kept: %+v", h)
 	}
@@ -355,7 +355,7 @@ func TestSessionRejectionOverRTSP(t *testing.T) {
 	// Reconnect burst within the window: 503 + Retry-After, no start.
 	for i := 0; i < 10; i++ {
 		status, headers := options()
-		if !strings.HasPrefix(status, "RTSP/1.0 503") || headers["Retry-After"] != "1" || headers["CSeq"] != "7" {
+		if !strings.HasPrefix(status, "RTSP/1.0 503") || headers["Retry-After"] != "12" || headers["CSeq"] != "7" {
 			t.Fatalf("refused attempt: %s %v", status, headers)
 		}
 	}
@@ -365,7 +365,7 @@ func TestSessionRejectionOverRTSP(t *testing.T) {
 
 	// After the window the next start fails again, within the keeper's
 	// 30 s min interval: no further check.
-	clock.Advance(time.Second)
+	clock.Advance(MinStartBackoff)
 	options()
 	waitFor(starter.called, "second start")
 	select {
