@@ -4,7 +4,7 @@ This is a pinned, patched fork of [seydx/tuya-ipc-terminal](https://github.com/s
 (MIT) maintained for the Cloud Video Surveillance & Evidence Retention project.
 It bridges Tuya WebRTC cameras (initially a CORN CHM-302) to a local RTSP
 endpoint that FFmpeg records from. Branch: `cvs`. Releases: `v0.0.6-cvs.1`, `v0.0.6-cvs.3`,
-`v0.0.6-cvs.4`, `v0.0.6-cvs.5`, `v0.0.6-cvs.6` (current; see [Changes in v0.0.6-cvs.6](#changes-in-v006-cvs6)).
+`v0.0.6-cvs.4`, `v0.0.6-cvs.5`, `v0.0.6-cvs.6`, `v0.0.6-cvs.7` (current; see [Changes in v0.0.6-cvs.7](#changes-in-v006-cvs7)).
 
 Nothing in this repository is environment-specific: no credentials, cookies,
 IP addresses or `.tuya-data` files. Session state is created at runtime in
@@ -47,6 +47,21 @@ Nothing was skipped: none of the picks turned out redundant with PR #33.
 | `51dbb80` | Session log times as RFC3339. |
 | `8b1cc52` | Pinned multi-stage `Dockerfile`, `.dockerignore`, `VERSION` = `0.0.6-cvs.1` (now a `var` so `-X main.VERSION=` works). |
 | `6442f3e` | CI (`ci.yml`: gofmt, build, vet, `test -race`, amd64+arm64 docker build) and release (`release.yml`: on `v*` tags push `ghcr.io/practicaldev101/tuya-ipc-terminal-cvs:<version>` and print the digest). Actions pinned by SHA. |
+
+## Changes in v0.0.6-cvs.7
+
+A stalled stream was restarted in the same second the previous session was
+disconnected. The camera kept that WebRTC slot for about 10 seconds and
+answered no offer sent inside the window; it then disconnected the new
+attempt, and the start backoff (1s, 2s, 4s, 8s) repeated the overlap.
+Restarts took about 90 seconds and sometimes several minutes. The watchdog
+now holds the next offer for 12 seconds, and a failed start waits 12s, then
+24s, then the 30s cap.
+
+| Commit | Change |
+|---|---|
+| (this release) | Quiet period after disconnect before the next WebRTC offer. |
+| (release) | `VERSION` = `0.0.6-cvs.7`. |
 
 ## Changes in v0.0.6-cvs.6
 
