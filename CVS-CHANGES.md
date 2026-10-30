@@ -61,7 +61,7 @@ now holds the next offer for 12 seconds, and a failed start waits 12s, then
 | Commit | Change |
 |---|---|
 | (this release) | Quiet period after disconnect before the next WebRTC offer. |
-| (release) | `VERSION` = `0.0.6-cvs.7`. |
+| (release) | `VERSION` = `0.0.6-cvs.7`. The image ldflags stamp the same string. |
 
 ## Changes in v0.0.6-cvs.6
 
