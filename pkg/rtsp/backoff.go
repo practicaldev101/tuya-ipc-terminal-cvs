@@ -21,9 +21,16 @@ import (
 // MaxStartBackoff and is cleared by a successful start. A start that Tuya
 // rejected (HTTP 401/403 or success=false) also asks the session keeper for
 // an immediate check of the camera's user.
+//
+// MinStartBackoff is also the quiet period after a disconnect (watchdog or
+// failed start) before the next offer. On CORN CHM-302, 2026-10-30, offers
+// sent 1s, 2s and 4s after the previous bridge stop got no WebRTC answer;
+// the camera disconnected that attempt about 10s later. The offer sent 10s
+// after the previous stop was answered. A shorter backoff makes every
+// restart burn four failed sessions and a gap of about 90s.
 
 const (
-	MinStartBackoff = time.Second
+	MinStartBackoff = 12 * time.Second
 	MaxStartBackoff = 30 * time.Second
 	// maxStartErrorLen bounds last_start_error (HTTP error bodies can be
 	// whole HTML pages).
@@ -31,7 +38,7 @@ const (
 )
 
 // startBackoffDelay returns the window after the given number of
-// consecutive failures (>= 1): 1, 2, 4, 8, 16, 30, 30, ... seconds.
+// consecutive failures (>= 1): 12, 24, 30, 30, ... seconds.
 func startBackoffDelay(failures int) time.Duration {
 	if failures < 1 {
 		return 0
@@ -101,6 +108,40 @@ func (s *RTSPServer) checkStartBackoffLocked(streamId string) error {
 		return &errStartBackoff{retryAt: entry.nextAttemptAt}
 	}
 	return nil
+}
+
+// armQuietAfterDisconnect holds the next start of this stream for
+// MinStartBackoff. A watchdog teardown is not a failed start (no error, the
+// failure count stays), but the camera still needs the quiet period before
+// it will answer a new offer. A later recordStartFailure may extend the
+// window; it does not shorten it.
+func (s *RTSPServer) armQuietAfterDisconnect(cs *CameraStream) {
+	if cs == nil {
+		return
+	}
+	now := s.clock()
+	until := now.Add(MinStartBackoff)
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if s.startBackoffs == nil {
+		s.startBackoffs = make(map[string]*startBackoff)
+	}
+	entry := s.startBackoffs[cs.streamId]
+	if entry == nil {
+		entry = &startBackoff{resolution: cs.resolution}
+		if cs.camera != nil {
+			entry.device = cs.camera.DeviceName
+			entry.deviceID = cs.camera.DeviceID
+			entry.rtspPath = cs.camera.RTSPPath
+		}
+		s.startBackoffs[cs.streamId] = entry
+	}
+	if until.After(entry.nextAttemptAt) {
+		entry.nextAttemptAt = until
+		if entry.failedAt.IsZero() {
+			entry.failedAt = now
+		}
+	}
 }
 
 // recordStartFailure extends the backoff of the stream and returns the
